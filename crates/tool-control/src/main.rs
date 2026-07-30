@@ -1,13 +1,15 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 //! 用户可直接修改的 Dioxus Desktop 控制端。
 //!
 //! 页面视觉以 `docs/design/control-app.html` 为参考，但不使用模拟标题栏或演示数据。
 
-use std::{fs, process::Command, time::Duration};
+use std::{fs, net::IpAddr, process::Command, time::Duration};
 
 use cocos_build_lan_contract::{ToolSettings, ToolStatus};
 use cocos_build_lan_core::{
-    CONTROL_PORT, CONTROL_PROTOCOL_VERSION, RestartReadiness, ServiceStatus, ToolError,
-    ToolLaunchSpec, ToolSupervisor, UpdateManifest, UpdateSource, receive_lan_manifest,
+    CONTROL_PROTOCOL_VERSION, LanManifestReceiver, RestartReadiness, ServiceStatus, ToolError,
+    ToolLaunchSpec, ToolSupervisor, UpdateManifest, UpdateSource,
 };
 
 use dioxus::{document, prelude::*};
@@ -71,7 +73,8 @@ struct ControlSnapshot {
 #[component]
 fn App() -> Element {
     let supervisor = use_context::<ToolSupervisor>();
-    let tool_id = supervisor.spec().identity.tool_id.to_string();
+    let tool_uuid = supervisor.spec().identity.tool_id;
+    let tool_id = tool_uuid.to_string();
     let theme_key = format!("lan-toolkit-theme-{tool_id}");
 
     let mut page = use_signal(|| Page::Overview);
@@ -79,6 +82,7 @@ fn App() -> Element {
     let mut service_running = use_signal(|| false);
     let mut connection = use_signal(|| "正在连接本机服务…".to_owned());
     let mut version = use_signal(|| "—".to_owned());
+    let mut control_port = use_signal(|| 0_u16);
     let mut business_status = use_signal(|| "尚未读取业务状态".to_owned());
     let mut server_path = use_signal(|| "—".to_owned());
     let mut readiness = use_signal(|| None::<RestartReadiness>);
@@ -119,6 +123,7 @@ fn App() -> Element {
                         service_running.set(true);
                         connection.set("运行中（健康检查已确认）".to_owned());
                         version.set(snapshot.service.health.version.to_string());
+                        control_port.set(snapshot.service.control_port);
                         server_path.set(snapshot.service.server_path.display().to_string());
                         business_status.set(format!(
                             "{}（已完成任务：{}）",
@@ -151,7 +156,7 @@ fn App() -> Element {
             spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
-                    let Ok(settings) = load_settings().await else {
+                    let Ok(settings) = load_settings(&supervisor).await else {
                         continue;
                     };
                     if settings.update.release_manifest_url.trim().is_empty() {
@@ -185,62 +190,72 @@ fn App() -> Element {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
-                    match receive_lan_manifest(Duration::from_secs(2)).await {
-                        Ok(manifest) => {
-                            if !persisted_settings().update.lan_dev_enabled {
-                                continue;
-                            }
-                            if manifest.source != UpdateSource::LanDev {
-                                last_check.set("已忽略非 LAN Dev 广播。".to_owned());
-                                continue;
-                            }
-                            let store = match supervisor.spec().update_store() {
-                                Ok(store) => store,
-                                Err(error) => {
-                                    last_check.set(format!("LAN Dev 初始化失败：{error}"));
+                    let receiver = match LanManifestReceiver::bind(tool_uuid).await {
+                        Ok(receiver) => receiver,
+                        Err(error) => {
+                            last_check.set(format!("LAN Dev 监听失败：{error}"));
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    };
+                    while persisted_settings().update.lan_dev_enabled {
+                        match receiver.receive(Duration::from_secs(2)).await {
+                            Ok(manifest) => {
+                                if !persisted_settings().update.lan_dev_enabled {
                                     continue;
                                 }
-                            };
-                            if let Err(error) = store.validate_manifest(&manifest) {
-                                last_check.set(format!("LAN Dev 广播已拒绝：{error}"));
-                                continue;
-                            }
-                            if pending_matches(&pending(), &manifest)
-                                || store.release_is_installed(&manifest.version)
-                            {
-                                last_check.set(format!(
-                                    "LAN Dev v{} 已暂存或安装，已忽略重复广播。",
-                                    manifest.version
-                                ));
-                                continue;
-                            }
-                            match supervisor.stage_update(manifest).await {
-                                Ok(staged) => {
+                                if manifest.source != UpdateSource::LanDev {
+                                    last_check.set("已忽略非 LAN Dev 广播。".to_owned());
+                                    continue;
+                                }
+                                let store = match supervisor.spec().update_store() {
+                                    Ok(store) => store,
+                                    Err(error) => {
+                                        last_check.set(format!("LAN Dev 初始化失败：{error}"));
+                                        continue;
+                                    }
+                                };
+                                if let Err(error) = store.validate_manifest(&manifest) {
+                                    last_check.set(format!("LAN Dev 广播已拒绝：{error}"));
+                                    continue;
+                                }
+                                if pending_matches(&pending(), &manifest)
+                                    || store.release_is_installed(&manifest.version)
+                                {
                                     last_check.set(format!(
-                                        "LAN Dev 已校验并暂存 {}",
-                                        staged.manifest.version
+                                        "LAN Dev v{} 已暂存或安装，已忽略重复广播。",
+                                        manifest.version
                                     ));
-                                    pending.set(Some(staged.clone()));
-                                    post_notice(
-                                        notice,
-                                        NoticeTone::Success,
-                                        "收到并暂存 LAN Dev 完整版本包。".to_owned(),
-                                    );
-                                    let saved = persisted_settings();
-                                    if saved.update.auto_apply_updates
-                                        && !settings_dirty()
-                                        && handoff_update(&supervisor, &staged).is_ok()
-                                    {
-                                        std::process::exit(0);
+                                    continue;
+                                }
+                                match supervisor.stage_update(manifest).await {
+                                    Ok(staged) => {
+                                        last_check.set(format!(
+                                            "LAN Dev 已校验并暂存 {}",
+                                            staged.manifest.version
+                                        ));
+                                        pending.set(Some(staged.clone()));
+                                        post_notice(
+                                            notice,
+                                            NoticeTone::Success,
+                                            "收到并暂存 LAN Dev 完整版本包。".to_owned(),
+                                        );
+                                        let saved = persisted_settings();
+                                        if saved.update.auto_apply_updates
+                                            && !settings_dirty()
+                                            && handoff_update(&supervisor, &staged).is_ok()
+                                        {
+                                            std::process::exit(0);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        last_check.set(format!("LAN Dev 下载或校验失败：{error}"))
                                     }
                                 }
-                                Err(error) => {
-                                    last_check.set(format!("LAN Dev 下载或校验失败：{error}"))
-                                }
                             }
+                            Err(ToolError::LanDevTimedOut) => {}
+                            Err(error) => last_check.set(format!("LAN Dev 监听失败：{error}")),
                         }
-                        Err(ToolError::LanDevTimedOut) => {}
-                        Err(error) => last_check.set(format!("LAN Dev 监听失败：{error}")),
                     }
                 }
             });
@@ -258,6 +273,9 @@ fn App() -> Element {
     let current_notice = notice();
     let rendered_log = filter_logs(&log_text(), &log_level(), &log_filter());
     let import_supervisor = supervisor.clone();
+    let preview_supervisor = supervisor.clone();
+    let settings_supervisor = supervisor.clone();
+    let lan_urls = local_lan_urls(settings().network.lan_port);
     let overview_selected = nav_class(page() == Page::Overview);
     let updates_selected = nav_class(page() == Page::Updates);
     let rollback_selected = nav_class(page() == Page::Rollback);
@@ -354,6 +372,7 @@ fn App() -> Element {
                                             service_running.set(true);
                                             connection.set("运行中（健康检查已确认）".to_owned());
                                             version.set(snapshot.service.health.version.to_string());
+                                            control_port.set(snapshot.service.control_port);
                                             server_path.set(snapshot.service.server_path.display().to_string());
                                             business_status.set(format!("{}（已完成任务：{}）", snapshot.business.summary, snapshot.business.completed_jobs));
                                             readiness.set(Some(snapshot.readiness));
@@ -420,6 +439,7 @@ fn App() -> Element {
                                                     service_running.set(true);
                                                     connection.set(if running { "运行中（已重启）" } else { "运行中（已启动）" }.to_owned());
                                                     version.set(service.health.version.to_string());
+                                                    control_port.set(service.control_port);
                                                     server_path.set(service.server_path.display().to_string());
                                                     post_notice(notice, NoticeTone::Success, if running { "已完成安全重启。" } else { "已启动服务。" }.to_owned());
                                                 }
@@ -450,7 +470,10 @@ fn App() -> Element {
                             div { class: "card-body kv",
                                 div { class: "k", "当前状态" } div { class: "v", "{connection}" }
                                 div { class: "k", "当前版本" } div { class: "v", "{version}" }
-                                div { class: "k", "回环 URL" } div { class: "v link", "http://127.0.0.1:{CONTROL_PORT}" }
+                                div { class: "k", "本机控制地址" } div { class: "v link", "http://127.0.0.1:{control_port}" }
+                                for (interface, url) in lan_urls.iter() {
+                                    div { class: "k", "局域网 · {interface}" } div { class: "v link", "{url}" }
+                                }
                                 div { class: "k", "服务二进制" } div { class: "v", "{server_path}" }
                                 div { class: "k", "业务状态" } div { class: "v", "{business_status}" }
                             }
@@ -586,17 +609,17 @@ fn App() -> Element {
                     article { class: "card settings-card",
                         div { class: "card-head", h2 { "本地设置（可在 tool-contract 自由扩展）" } span { class: "pill info", if settings_dirty() { "未保存" } else { "已保存" } } }
                         div { class: "card-body",
-                            div { class: "form-intro", "服务端将设置持久化到本机数据目录。tool_id 来自 tool.json，不能在此覆盖。扩展 BusinessSettings 后，在这里添加相应字段。" }
+                            div { class: "form-intro", "服务端将设置持久化到本机数据目录。tool_id 来自 tool.json，不能在此覆盖。" }
                             div { class: "settings-grid",
                                 label { class: "field",
-                                    span { "业务问候语" }
-                                    input { value: "{settings().business.greeting}", placeholder: "例如：你好，来自局域网工具", oninput: move |event| {
+                                    span { "局域网访问端口" }
+                                    input { r#type: "number", min: "1", max: "65535", value: "{settings().network.lan_port}", oninput: move |event| {
                                         let mut next = settings();
-                                        next.business.greeting = event.value();
+                                        next.network.lan_port = event.value().parse().unwrap_or(0);
                                         settings.set(next);
                                         settings_dirty.set(true);
                                     } }
-                                    small { "模板业务示例；你可以替换 BusinessSettings 并新增字段。" }
+                                    small { "保存后立即安全重启；端口被占用时保持原服务不变。" }
                                 }
                                 label { class: "field",
                                     span { "Git 账号（仅本机）" }
@@ -649,24 +672,45 @@ fn App() -> Element {
                             }
                             div { class: "form-actions",
                                 button { class: "btn primary", onclick: {
+                                    let supervisor = settings_supervisor.clone();
                                     move |_| {
+                                        let supervisor = supervisor.clone();
                                         let value = settings();
+                                        let previous = persisted_settings();
                                         spawn(async move {
-                                            match save_settings(&value).await {
-                                                Ok(saved) => {
+                                            match save_and_apply_settings(&supervisor, &value, &previous).await {
+                                                Ok((saved, service)) => {
                                                     persisted_settings.set(saved.clone());
                                                     settings.set(saved);
                                                     settings_dirty.set(false);
-                                                    post_notice(notice, NoticeTone::Success, "设置已保存到运行中的服务端。".to_owned());
+                                                    if let Some(service) = service {
+                                                        control_port.set(service.control_port);
+                                                        version.set(service.health.version.to_string());
+                                                        server_path.set(service.server_path.display().to_string());
+                                                        connection.set("运行中（端口已切换）".to_owned());
+                                                    }
+                                                    post_notice(notice, NoticeTone::Success, "设置已保存。".to_owned());
                                                 }
-                                                Err(error) => post_notice(notice, NoticeTone::Error, format!("保存设置失败：{error}")),
+                                                Err(error) => {
+                                                    if let Ok(snapshot) = load_snapshot(&supervisor).await {
+                                                        control_port.set(snapshot.service.control_port);
+                                                        persisted_settings.set(snapshot.settings.clone());
+                                                        settings.set(snapshot.settings);
+                                                        settings_dirty.set(false);
+                                                        readiness.set(Some(snapshot.readiness));
+                                                    }
+                                                    post_notice(notice, NoticeTone::Error, format!("保存设置失败：{error}"));
+                                                }
                                             }
                                         });
                                     }
                                 }, "保存设置" }
-                                button { class: "btn", onclick: move |_| {
+                                button { class: "btn", onclick: {
+                                    let supervisor = settings_supervisor.clone();
+                                    move |_| {
+                                    let supervisor = supervisor.clone();
                                     spawn(async move {
-                                        match load_settings().await {
+                                        match load_settings(&supervisor).await {
                                             Ok(saved) => {
                                                 persisted_settings.set(saved.clone());
                                                 settings.set(saved);
@@ -676,7 +720,7 @@ fn App() -> Element {
                                             Err(error) => post_notice(notice, NoticeTone::Error, format!("读取设置失败：{error}")),
                                         }
                                     });
-                                }, "还原" }
+                                } }, "还原" }
                             }
                             article { class: "card", style: "margin-top:18px",
                                 div { class: "card-head", h2 { "一次性导入旧 Cocos Build 数据" } }
@@ -689,10 +733,13 @@ fn App() -> Element {
                                         }
                                     }
                                     div { class: "form-actions",
-                                        button { class: "btn", disabled: legacy_data_dir().trim().is_empty(), onclick: move |_| {
+                                        button { class: "btn", disabled: legacy_data_dir().trim().is_empty(), onclick: {
+                                            let supervisor = preview_supervisor.clone();
+                                            move |_| {
+                                            let supervisor = supervisor.clone();
                                             let path = legacy_data_dir();
                                             spawn(async move {
-                                                match preview_legacy_import(&path).await {
+                                                match preview_legacy_import(&supervisor, &path).await {
                                                     Ok(preview) => {
                                                         legacy_preview.set(Some(preview));
                                                         post_notice(notice, NoticeTone::Success, "旧数据预览完成；请核对后确认导入。".to_owned());
@@ -700,14 +747,14 @@ fn App() -> Element {
                                                     Err(error) => post_notice(notice, NoticeTone::Error, format!("预览失败：{error}")),
                                                 }
                                             });
-                                        }, "预览导入" }
+                                        } }, "预览导入" }
                                         if let Some(preview) = legacy_preview() {
                                             LegacyPreview { preview: preview.clone() }
                                             button { class: "btn danger", onclick: move |_| {
                                                 let path = legacy_data_dir();
                                                 let supervisor = import_supervisor.clone();
                                                 spawn(async move {
-                                                    match import_legacy_data(&path).await {
+                                                    match import_legacy_data(&supervisor, &path).await {
                                                         Ok(_) => match load_snapshot(&supervisor).await {
                                                             Ok(snapshot) => {
                                                                 settings.set(snapshot.settings.clone());
@@ -848,7 +895,7 @@ async fn load_snapshot(supervisor: &ToolSupervisor) -> Result<ControlSnapshot, S
         .start()
         .await
         .map_err(|error| error.to_string())?;
-    let (settings, business) = load_service_data()
+    let (settings, business) = load_service_data(service.control_port)
         .await
         .map_err(|error| error.to_string())?;
     let readiness = supervisor
@@ -865,11 +912,13 @@ async fn load_snapshot(supervisor: &ToolSupervisor) -> Result<ControlSnapshot, S
     })
 }
 
-async fn load_service_data() -> Result<(ToolSettings, ToolStatus), reqwest::Error> {
+async fn load_service_data(
+    control_port: u16,
+) -> Result<(ToolSettings, ToolStatus), reqwest::Error> {
     let client = reqwest::Client::new();
     let settings = client
         .get(format!(
-            "http://127.0.0.1:{CONTROL_PORT}/api/control-config"
+            "http://127.0.0.1:{control_port}/api/control-config"
         ))
         .send()
         .await?
@@ -878,7 +927,7 @@ async fn load_service_data() -> Result<(ToolSettings, ToolStatus), reqwest::Erro
         .await?;
     let business = client
         .get(format!(
-            "http://127.0.0.1:{CONTROL_PORT}/api/control-status"
+            "http://127.0.0.1:{control_port}/api/control-status"
         ))
         .send()
         .await?
@@ -888,55 +937,144 @@ async fn load_service_data() -> Result<(ToolSettings, ToolStatus), reqwest::Erro
     Ok((settings, business))
 }
 
-async fn load_settings() -> Result<ToolSettings, reqwest::Error> {
+async fn load_settings(supervisor: &ToolSupervisor) -> Result<ToolSettings, String> {
+    let port = supervisor
+        .probe()
+        .await
+        .map_err(|error| error.to_string())?
+        .control_port;
     reqwest::Client::new()
-        .get(format!(
-            "http://127.0.0.1:{CONTROL_PORT}/api/control-config"
-        ))
+        .get(format!("http://127.0.0.1:{port}/api/control-config"))
         .send()
-        .await?
-        .error_for_status()?
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?
         .json()
         .await
+        .map_err(|error| error.to_string())
 }
 
-async fn save_settings(settings: &ToolSettings) -> Result<ToolSettings, reqwest::Error> {
+async fn save_settings(
+    supervisor: &ToolSupervisor,
+    settings: &ToolSettings,
+) -> Result<ToolSettings, String> {
+    let port = supervisor
+        .probe()
+        .await
+        .map_err(|error| error.to_string())?
+        .control_port;
     reqwest::Client::new()
-        .put(format!(
-            "http://127.0.0.1:{CONTROL_PORT}/api/control-config"
-        ))
+        .put(format!("http://127.0.0.1:{port}/api/control-config"))
         .json(settings)
         .send()
-        .await?
-        .error_for_status()?
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?
         .json()
         .await
+        .map_err(|error| error.to_string())
 }
 
-async fn preview_legacy_import(data_dir: &str) -> Result<serde_json::Value, reqwest::Error> {
+async fn preview_legacy_import(
+    supervisor: &ToolSupervisor,
+    data_dir: &str,
+) -> Result<serde_json::Value, String> {
+    let port = supervisor
+        .probe()
+        .await
+        .map_err(|error| error.to_string())?
+        .control_port;
     reqwest::Client::new()
         .post(format!(
-            "http://127.0.0.1:{CONTROL_PORT}/api/control/import/preview"
+            "http://127.0.0.1:{port}/api/control/import/preview"
         ))
         .json(&serde_json::json!({ "dataDir": data_dir }))
         .send()
-        .await?
-        .error_for_status()?
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?
         .json()
         .await
+        .map_err(|error| error.to_string())
 }
 
-async fn import_legacy_data(data_dir: &str) -> Result<serde_json::Value, reqwest::Error> {
+async fn import_legacy_data(
+    supervisor: &ToolSupervisor,
+    data_dir: &str,
+) -> Result<serde_json::Value, String> {
+    let port = supervisor
+        .probe()
+        .await
+        .map_err(|error| error.to_string())?
+        .control_port;
     reqwest::Client::new()
-        .post(format!(
-            "http://127.0.0.1:{CONTROL_PORT}/api/control/import"
-        ))
+        .post(format!("http://127.0.0.1:{port}/api/control/import"))
         .json(&serde_json::json!({ "dataDir": data_dir }))
         .send()
-        .await?
-        .error_for_status()?
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?
         .json()
         .await
+        .map_err(|error| error.to_string())
+}
+
+async fn save_and_apply_settings(
+    supervisor: &ToolSupervisor,
+    settings: &ToolSettings,
+    previous: &ToolSettings,
+) -> Result<(ToolSettings, Option<ServiceStatus>), String> {
+    let port_changed = settings.network.lan_port != previous.network.lan_port;
+    if port_changed {
+        let readiness = supervisor
+            .readiness()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !readiness.permits_automatic_apply() {
+            return Err(format!("当前重启状态为 {}，端口未保存", readiness.label()));
+        }
+    }
+
+    let saved = save_settings(supervisor, settings).await?;
+    if !port_changed {
+        return Ok((saved, None));
+    }
+
+    let mut rollback = saved.clone();
+    rollback.network.lan_port = previous.network.lan_port;
+    if let Err(error) = supervisor.stop().await {
+        let _ = save_settings(supervisor, &rollback).await;
+        return Err(format!("无法停止旧端口服务，已恢复原端口：{error}"));
+    }
+    match supervisor.start().await {
+        Ok(service) => Ok((saved, Some(service))),
+        Err(error) => {
+            write_settings_file(&supervisor.spec().paths.config_file(), &rollback)
+                .map_err(|restore| format!("新端口启动失败：{error}；恢复配置也失败：{restore}"))?;
+            let restored = supervisor
+                .start()
+                .await
+                .map_err(|restore| format!("新端口启动失败：{error}；旧端口恢复失败：{restore}"))?;
+            Err(format!(
+                "新端口启动失败，已恢复旧端口 {}（控制端口 {}）：{error}",
+                rollback.network.lan_port, restored.control_port
+            ))
+        }
+    }
+}
+
+fn write_settings_file(path: &std::path::Path, settings: &ToolSettings) -> Result<(), String> {
+    let temporary = path.with_extension("tmp");
+    fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(settings).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    fs::rename(temporary, path).map_err(|error| error.to_string())
 }
 
 fn load_release_rows(supervisor: &ToolSupervisor) -> Result<Vec<ReleaseRow>, String> {
@@ -1066,6 +1204,27 @@ fn human_size(size: u64) -> String {
     }
 }
 
+fn local_lan_urls(port: u16) -> Vec<(String, String)> {
+    let mut urls = local_ip_address::list_afinet_netifas()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(interface, address)| match address {
+            IpAddr::V4(address)
+                if !address.is_loopback()
+                    && !address.is_unspecified()
+                    && !address.is_multicast()
+                    && !address.is_link_local() =>
+            {
+                Some((interface, format!("http://{address}:{port}")))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    urls.sort();
+    urls.dedup();
+    urls
+}
+
 fn handoff_update(
     supervisor: &ToolSupervisor,
     pending: &cocos_build_lan_core::PendingUpdate,
@@ -1077,18 +1236,29 @@ fn handoff_update(
             launcher.display()
         ));
     }
-    Command::new(launcher)
-        .current_dir(&supervisor.spec().project_dir)
-        .args([
-            "--apply-staged",
-            &pending.staging_path().display().to_string(),
-            "--wait-pid",
-            &std::process::id().to_string(),
-        ])
+    let mut command = Command::new(launcher);
+    command.current_dir(&supervisor.spec().project_dir).args([
+        "--apply-staged",
+        &pending.staging_path().display().to_string(),
+        "--wait-pid",
+        &std::process::id().to_string(),
+    ]);
+    hide_std_command_window(&mut command);
+    command
         .spawn()
         .map_err(|error| format!("启动更新交接器失败：{error}"))?;
     Ok(())
 }
+
+#[cfg(windows)]
+fn hide_std_command_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_std_command_window(_command: &mut Command) {}
 
 fn filter_logs(contents: &str, level: &str, filter: &str) -> String {
     let keyword = filter.trim().to_lowercase();

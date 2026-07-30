@@ -10,10 +10,19 @@ pub use cocos_build_lan_core::*;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolSettings {
+    /// 本机网络配置。
+    #[serde(default)]
+    pub network: NetworkSettings,
     /// 更新与发布配置。
     pub update: UpdateSettings,
     /// 工具业务配置。可按项目需求扩展字段。
     pub business: BusinessSettings,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NetworkSettings {
+    /// 局域网业务页面与 API 的 TCP 端口；0 仅表示首次启动时尚未分配。
+    pub lan_port: u16,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -36,25 +45,13 @@ impl Default for UpdateSettings {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BusinessSettings {
     /// 仅由本机控制端保存；网页 API 从不返回密码。
     #[serde(default)]
     pub git_username: String,
     #[serde(default)]
     pub git_password: String,
-    /// 保留为本机控制端状态摘要，不参与网页配置。
-    pub greeting: String,
-}
-
-impl Default for BusinessSettings {
-    fn default() -> Self {
-        Self {
-            git_username: String::new(),
-            git_password: String::new(),
-            greeting: "你好，来自局域网工具".to_owned(),
-        }
-    }
 }
 
 impl BusinessSettings {
@@ -92,5 +89,31 @@ impl Default for ToolStatus {
             summary: "服务正在运行，等待你的业务逻辑".to_owned(),
             completed_jobs: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_settings_gain_an_unassigned_network_port_and_drop_greeting() {
+        let old = serde_json::json!({
+            "update": {
+                "release_manifest_url": "",
+                "auto_apply_updates": true,
+                "lan_dev_enabled": false
+            },
+            "business": {
+                "git_username": "user",
+                "git_password": "token",
+                "greeting": "legacy"
+            }
+        });
+        let settings: ToolSettings = serde_json::from_value(old).expect("old settings");
+        assert_eq!(settings.network.lan_port, 0);
+        assert_eq!(settings.business.git_username, "user");
+        let serialized = serde_json::to_value(settings).expect("serialize settings");
+        assert!(serialized["business"].get("greeting").is_none());
     }
 }

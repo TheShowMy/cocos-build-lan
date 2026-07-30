@@ -8,12 +8,16 @@ rust-version.workspace = true
 [dependencies]
 dioxus = { workspace = true, features = ["desktop", "document"] }
 dioxus-desktop.workspace = true
+local-ip-address.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 cocos-build-lan-contract = { path = "../tool-contract" }
 cocos-build-lan-core = { path = "../tool-core" }
+
+[build-dependencies]
+winres = "0.1.12"
 
 [dev-dependencies]
 semver.workspace = true

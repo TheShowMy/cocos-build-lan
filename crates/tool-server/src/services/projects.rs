@@ -165,14 +165,14 @@ mod tests {
         assert!(status.success(), "git command failed: {:?}", args);
     }
 
-    async fn git_with_input(repo_dir: &std::path::Path, script: &str) -> std::process::Output {
-        Command::new("/bin/zsh")
-            .arg("-lc")
-            .arg(script)
-            .current_dir(repo_dir)
+    async fn git_output(repo_dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_dir)
+            .args(args)
             .output()
             .await
-            .expect("run shell command")
+            .expect("run git command")
     }
 
     async fn init_repo(repo_dir: &std::path::Path) {
@@ -215,7 +215,7 @@ mod tests {
         assert!(response.had_unstaged_changes);
         assert!(response.had_untracked_files);
 
-        let status_output = git_with_input(&repo_dir, "git status --porcelain").await;
+        let status_output = git_output(&repo_dir, &["status", "--porcelain"]).await;
         assert!(status_output.status.success());
         assert!(
             String::from_utf8_lossy(&status_output.stdout)

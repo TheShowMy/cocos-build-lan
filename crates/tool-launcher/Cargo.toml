@@ -1,13 +1,18 @@
 [package]
-name = "cocos-build-lan-contract"
+name = "cocos-build-lan-launcher"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[dependencies]
-serde.workspace = true
-cocos-build-lan-core = { path = "../tool-core" }
+[[bin]]
+name = "cocos-build-lan"
+path = "src/main.rs"
 
-[dev-dependencies]
+[dependencies]
+cocos-build-lan-core = { path = "../tool-core" }
 serde_json.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+winres = "0.1.12"

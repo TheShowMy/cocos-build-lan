@@ -6,7 +6,7 @@
 
 ## 新增一个业务配置字段
 
-以新增“业务问候语”外的字段为例：
+新增业务配置字段时：
 
 1. 在 `crates/tool-contract` 的 `BusinessSettings` 增加字段和默认值。
 2. 让 `tool-server` 的 `GET/PUT /api/control-config` 继续读写该强类型设置；业务逻辑从 `settings.business` 读取它。

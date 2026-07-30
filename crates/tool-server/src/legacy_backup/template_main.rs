@@ -7,17 +7,16 @@ use std::{fs, net::SocketAddr, sync::Arc};
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::State,
     response::Html,
     routing::get,
 };
 use dioxus::prelude::VirtualDom;
 use semver::Version;
-use serde::Deserialize;
 use tokio::sync::RwLock;
 
 use cocos_build_lan_contract::{ToolSettings, ToolStatus};
-use cocos_build_lan_core::{CONTROL_PORT, ToolLaunchSpec, ToolPaths, ToolRuntime};
+use cocos_build_lan_core::{ToolLaunchSpec, ToolPaths, ToolRuntime, control_port_candidates};
 
 #[derive(Clone)]
 struct ServerState {
@@ -37,16 +36,17 @@ async fn main() {
         paths: spec.paths.clone(),
     };
     let runtime = ToolRuntime::new(
-        spec.identity,
+        spec.identity.clone(),
         Version::parse(env!("CARGO_PKG_VERSION")).expect("有效的包版本"),
     );
     let app = runtime.clone().router().merge(business_router(state));
-    let address: SocketAddr = format!("127.0.0.1:{CONTROL_PORT}")
+    let control_port = control_port_candidates(spec.identity.tool_id)[0];
+    let address: SocketAddr = format!("127.0.0.1:{control_port}")
         .parse()
         .expect("有效的回环监听地址");
     let listener = tokio::net::TcpListener::bind(address)
         .await
-        .expect("绑定回环端口；请确认没有其他服务占用 8765");
+        .expect("绑定当前工具的回环控制端口");
     println!("服务端已监听 http://{address}");
     let shutdown_runtime = runtime.clone();
     axum::serve(listener, app)
@@ -58,7 +58,6 @@ async fn main() {
 fn business_router(state: ServerState) -> Router {
     Router::new()
         .route("/", get(tool_page))
-        .route("/api/greeting", get(greeting))
         .route("/api/control-status", get(control_status))
         .route(
             "/api/control-config",
@@ -96,9 +95,9 @@ fn write_settings(path: &std::path::Path, settings: &ToolSettings) -> Result<(),
 }
 
 async fn control_status(State(state): State<ServerState>) -> Json<ToolStatus> {
-    let settings = state.settings.read().await;
+    let _settings = state.settings.read().await;
     Json(ToolStatus {
-        summary: format!("服务正在运行：{}", settings.business.greeting),
+        summary: "服务正在运行".to_owned(),
         completed_jobs: 0,
     })
 }
@@ -119,22 +118,6 @@ async fn save_control_config(
     })?;
     *state.settings.write().await = settings.clone();
     Ok(Json(settings))
-}
-
-#[derive(Deserialize)]
-struct GreetingQuery {
-    name: Option<String>,
-}
-
-async fn greeting(
-    State(state): State<ServerState>,
-    Query(query): Query<GreetingQuery>,
-) -> Json<serde_json::Value> {
-    let settings = state.settings.read().await;
-    let name = query.name.as_deref().unwrap_or("访客").trim();
-    Json(serde_json::json!({
-        "message": format!("{}，{}！", settings.business.greeting, name),
-    }))
 }
 
 async fn tool_page() -> Html<String> {
@@ -165,7 +148,6 @@ mod tests {
         };
         let app = business_router(state);
         let mut expected = ToolSettings::default();
-        expected.business.greeting = "已保存的业务配置".to_owned();
         expected.update.lan_dev_enabled = true;
         let response = app
             .clone()

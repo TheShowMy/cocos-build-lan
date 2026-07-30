@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 //! 稳定启动器：在控制端退出后应用完整版本包，并重新打开控制端。
 
 use std::{env, fs, path::PathBuf, process::Stdio, time::Duration};
@@ -13,7 +15,7 @@ async fn main() {
         return;
     };
     if command != "--apply-staged" {
-        eprintln!("用法：tool-launcher [--apply-staged <staging-dir> --wait-pid <pid>]");
+        eprintln!("用法：cocos-build-lan [--apply-staged <staging-dir> --wait-pid <pid>]");
         std::process::exit(2);
     }
     let staging = args.next().map(PathBuf::from).unwrap_or_else(|| {
@@ -92,12 +94,13 @@ fn launch_control(spec: &ToolLaunchSpec) -> Result<(), String> {
     let control = spec
         .active_control_path()
         .map_err(|error| error.to_string())?;
-    std::process::Command::new(control)
+    let mut command = std::process::Command::new(control);
+    command
         .current_dir(&spec.project_dir)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| error.to_string())?;
+        .stderr(Stdio::null());
+    hide_command_window(&mut command);
+    command.spawn().map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -132,8 +135,10 @@ fn process_exists(pid: u32) -> Result<bool, String> {
 
 #[cfg(windows)]
 fn process_exists(pid: u32) -> Result<bool, String> {
-    let output = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+    let mut command = std::process::Command::new("tasklist");
+    command.args(["/FI", &format!("PID eq {pid}"), "/NH"]);
+    hide_command_window(&mut command);
+    let output = command
         .output()
         .map_err(|error| format!("无法检查旧控制端进程：{error}"))?;
     if !output.status.success() {
@@ -142,6 +147,16 @@ fn process_exists(pid: u32) -> Result<bool, String> {
     let listing = String::from_utf8_lossy(&output.stdout);
     Ok(!listing.contains("No tasks are running") && listing.contains(&pid.to_string()))
 }
+
+#[cfg(windows)]
+fn hide_command_window(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_command_window(_command: &mut std::process::Command) {}
 
 #[cfg(not(any(unix, windows)))]
 fn process_exists(_pid: u32) -> Result<bool, String> {

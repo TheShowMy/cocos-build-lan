@@ -24,6 +24,7 @@ pub struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     /// 执行完整混淆流程
     Run(RunArgs),

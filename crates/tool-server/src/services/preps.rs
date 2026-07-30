@@ -1476,8 +1476,9 @@ mod tests {
             validate_import_file_path("../lib.py").expect_err("parent path should fail");
         assert!(parent_error.contains("不合法"));
 
-        let absolute_error =
-            validate_import_file_path("/tmp/lib.py").expect_err("absolute path should fail");
+        let absolute_path = std::env::temp_dir().join("lib.py");
+        let absolute_error = validate_import_file_path(&absolute_path.to_string_lossy())
+            .expect_err("absolute path should fail");
         assert!(absolute_error.contains("相对路径"));
     }
 

@@ -28,7 +28,7 @@
 2. 同步修改服务端的配置读写或业务 API、控制端的受控表单或真实状态卡片，以及需要时的 Web UI。
 3. 不要把设置退回 JSON 编辑器，也不要用模拟数据替代服务、PID、版本、更新或日志等真实运行状态。
 4. 优先改用户项目拥有的四个 crate：`tool-contract`、`tool-server`、`tool-control`、`tool-app`。`tool-core` 只放无 UI 的通用运行时和协议能力。
-5. `cargo run -p cocos-build-lan-control` 是开发模式。生产环境只能从首次安装包目录的 `cocos-build-lan-launcher` 启动；完整控制端更新由 launcher 接管，不能在开发模式自行替换控制端。
+5. `cargo run -p cocos-build-lan-control` 是开发模式。生产环境只能从首次安装包根目录的 `cocos-build-lan.exe` 启动；完整控制端更新由 launcher 接管，不能在开发模式自行替换控制端。
 
 ## 验证
 

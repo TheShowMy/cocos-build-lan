@@ -36,8 +36,52 @@ use uuid::Uuid;
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
-pub const CONTROL_PORT: u16 = 8765;
-pub const LAN_DEV_PORT: u16 = 49153;
+const CONTROL_PORT_RANGE: (u16, u16) = (41_000, 42_999);
+const BUSINESS_PORT_RANGE: (u16, u16) = (43_000, 44_999);
+const LAN_DISCOVERY_PORT_RANGE: (u16, u16) = (45_000, 46_999);
+const PORT_CANDIDATE_COUNT: usize = 8;
+
+#[must_use]
+pub fn control_port_candidates(tool_id: Uuid) -> Vec<u16> {
+    port_candidates(tool_id, b"control", CONTROL_PORT_RANGE)
+}
+
+#[must_use]
+pub fn business_port_candidates(tool_id: Uuid) -> Vec<u16> {
+    port_candidates(tool_id, b"business", BUSINESS_PORT_RANGE)
+}
+
+#[must_use]
+pub fn lan_discovery_ports(tool_id: Uuid) -> Vec<u16> {
+    port_candidates(tool_id, b"lan-discovery", LAN_DISCOVERY_PORT_RANGE)
+}
+
+fn port_candidates(tool_id: Uuid, purpose: &[u8], range: (u16, u16)) -> Vec<u16> {
+    let width = u32::from(range.1 - range.0) + 1;
+    let mut ports = Vec::with_capacity(PORT_CANDIDATE_COUNT);
+    let mut index = 0_u32;
+    while ports.len() < PORT_CANDIDATE_COUNT {
+        let mut hash = Sha256::new();
+        hash.update(tool_id.as_bytes());
+        hash.update(purpose);
+        hash.update(index.to_le_bytes());
+        let digest = hash.finalize();
+        let offset = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) % width;
+        let port = range.0 + offset as u16;
+        if !ports.contains(&port) {
+            ports.push(port);
+        }
+        index += 1;
+    }
+    ports
+}
+
+#[must_use]
+pub fn first_available_business_port(tool_id: Uuid, control_port: u16) -> Option<u16> {
+    business_port_candidates(tool_id).into_iter().find(|port| {
+        *port != control_port && std::net::TcpListener::bind(("0.0.0.0", *port)).is_ok()
+    })
+}
 
 /// 除两个二进制外一同切换的只读发布资源。资源被放入 `bin/`，因此服务端可
 /// 通过自身可执行文件相邻目录定位 `web/`、`scripts/` 等文件。
@@ -658,7 +702,8 @@ fn add_directory_to_bundle<W: io::Write + io::Seek>(
         if !path.is_file() {
             continue;
         }
-        archive.start_file(target.to_string_lossy(), options)?;
+        let entry_name = target.to_string_lossy().replace('\\', "/");
+        archive.start_file(entry_name, options)?;
         io::copy(&mut fs::File::open(path)?, archive)?;
     }
     Ok(())
@@ -764,17 +809,35 @@ impl ToolLaunchSpec {
         let tool: ToolFile = serde_json::from_slice(&fs::read(project_dir.join("tool.json"))?)?;
         let paths = ToolPaths::for_tool(tool.tool_id)?;
         let executable_dir = std::env::current_exe()?.parent().map(Path::to_path_buf);
-        let fallback_server = executable_dir.as_deref().map_or_else(
-            || project_dir.join(&server_binary_name),
-            |dir| dir.join(&server_binary_name),
+        let fallback_server =
+            resolve_fallback_binary(executable_dir.as_deref(), &project_dir, &server_binary_name);
+        let fallback_control = resolve_fallback_binary(
+            executable_dir.as_deref(),
+            &project_dir,
+            &control_binary_name,
         );
-        let fallback_control = executable_dir.as_deref().map_or_else(
-            || project_dir.join(&control_binary_name),
-            |dir| dir.join(&control_binary_name),
-        );
-        let launcher_name = control_binary_name
-            .to_string_lossy()
-            .replace("-control", "-launcher");
+        let control_stem = Path::new(&control_binary_name)
+            .file_stem()
+            .unwrap_or(&control_binary_name)
+            .to_string_lossy();
+        let project_name = control_stem.trim_end_matches("-control");
+        let launcher_name = platform_binary_name(project_name.into());
+        let legacy_launcher_name = platform_binary_name(format!("{project_name}-launcher").into());
+        let launcher_path = [
+            project_dir.join(&launcher_name),
+            project_dir.join(&legacy_launcher_name),
+            executable_dir
+                .as_deref()
+                .unwrap_or(&project_dir)
+                .join(&launcher_name),
+            executable_dir
+                .as_deref()
+                .unwrap_or(&project_dir)
+                .join(&legacy_launcher_name),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| project_dir.join(&launcher_name));
         Ok(Self {
             identity: ToolIdentity {
                 tool_id: tool.tool_id,
@@ -783,10 +846,7 @@ impl ToolLaunchSpec {
             project_dir: project_dir.clone(),
             fallback_server,
             fallback_control,
-            launcher_path: executable_dir.map_or_else(
-                || project_dir.join(platform_binary_name(launcher_name.clone().into())),
-                |dir| dir.join(platform_binary_name(launcher_name.clone().into())),
-            ),
+            launcher_path,
             server_binary_name,
             control_binary_name,
             paths,
@@ -822,6 +882,23 @@ impl ToolLaunchSpec {
         }
         Ok(self.fallback_control.clone())
     }
+}
+
+fn resolve_fallback_binary(
+    executable_dir: Option<&Path>,
+    project_dir: &Path,
+    binary_name: &OsString,
+) -> PathBuf {
+    let executable_dir = executable_dir.unwrap_or(project_dir);
+    [
+        executable_dir.join(binary_name),
+        executable_dir.join("bin").join(binary_name),
+        project_dir.join("bin").join(binary_name),
+        project_dir.join(binary_name),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .unwrap_or_else(|| project_dir.join("bin").join(binary_name))
 }
 
 fn find_project_dir() -> Result<PathBuf, ToolError> {
@@ -869,6 +946,7 @@ impl PendingUpdate {
 pub struct ServiceStatus {
     pub health: HealthResponse,
     pub server_path: PathBuf,
+    pub control_port: u16,
 }
 
 impl ToolSupervisor {
@@ -887,30 +965,41 @@ impl ToolSupervisor {
     }
 
     pub async fn probe(&self) -> Result<ServiceStatus, ToolError> {
-        let response = self
-            .client
-            .get(format!("http://127.0.0.1:{CONTROL_PORT}/healthz"))
-            .send()
-            .await?
-            .error_for_status()?;
-        let health: HealthResponse = response.json().await?;
-        if health.tool_id != self.spec.identity.tool_id
-            || health.protocol != CONTROL_PROTOCOL_VERSION
-        {
-            return Err(ToolError::DifferentTool);
+        for port in control_port_candidates(self.spec.identity.tool_id) {
+            let Ok(response) = self
+                .client
+                .get(control_url(port, "/healthz"))
+                .timeout(Duration::from_millis(400))
+                .send()
+                .await
+            else {
+                continue;
+            };
+            let Ok(response) = response.error_for_status() else {
+                continue;
+            };
+            let Ok(health) = response.json::<HealthResponse>().await else {
+                continue;
+            };
+            if health.tool_id == self.spec.identity.tool_id
+                && health.protocol == CONTROL_PROTOCOL_VERSION
+            {
+                return Ok(ServiceStatus {
+                    health,
+                    server_path: self.spec.active_server_path()?,
+                    control_port: port,
+                });
+            }
         }
-        Ok(ServiceStatus {
-            health,
-            server_path: self.spec.active_server_path()?,
-        })
+        Err(ToolError::ServiceUnavailable)
     }
 
     pub async fn start(&self) -> Result<ServiceStatus, ToolError> {
-        match self.probe().await {
-            Ok(status) => return Ok(status),
-            Err(ToolError::DifferentTool) => return Err(ToolError::DifferentTool),
-            Err(_) => {}
+        if let Ok(status) = self.probe().await {
+            return Ok(status);
         }
+        let control_port = available_control_port(self.spec.identity.tool_id)
+            .ok_or(ToolError::ControlPortsUnavailable)?;
         let path = self.spec.active_server_path()?;
         if !path.is_file() {
             return Err(ToolError::ServerBinaryMissing(path));
@@ -920,11 +1009,14 @@ impl ToolSupervisor {
             .append(true)
             .open(self.spec.paths.server_log())?;
         let log_error = log.try_clone()?;
-        let child = Command::new(&path)
+        let mut command = Command::new(&path);
+        command
             .current_dir(&self.spec.project_dir)
+            .env("COCOS_BUILD_LAN_CONTROL_PORT", control_port.to_string())
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(log_error))
-            .spawn()?;
+            .stderr(Stdio::from(log_error));
+        hide_command_window(&mut command);
+        let child = command.spawn()?;
         *self.child.lock().await = Some(child);
         for _ in 0..40 {
             sleep(Duration::from_millis(125)).await;
@@ -932,15 +1024,22 @@ impl ToolSupervisor {
                 return Ok(status);
             }
         }
+        if let Some(mut child) = self.child.lock().await.take() {
+            let _ = child.kill().await;
+        }
         Err(ToolError::ServiceDidNotBecomeHealthy)
     }
 
     pub async fn readiness(&self) -> Result<RestartReadiness, ToolError> {
+        let port = self.probe().await?.control_port;
+        self.readiness_on(port).await
+    }
+
+    async fn readiness_on(&self, port: u16) -> Result<RestartReadiness, ToolError> {
         let response = self
             .client
-            .get(format!(
-                "http://127.0.0.1:{CONTROL_PORT}/_lan/control/restart-readiness"
-            ))
+            .get(control_url(port, "/_lan/control/restart-readiness"))
+            .timeout(Duration::from_millis(400))
             .send()
             .await?
             .error_for_status()?;
@@ -952,8 +1051,8 @@ impl ToolSupervisor {
     }
 
     pub async fn stop(&self) -> Result<(), ToolError> {
-        self.probe().await?;
-        let readiness = self.readiness().await?;
+        let port = self.probe().await?.control_port;
+        let readiness = self.readiness_on(port).await?;
         if !readiness.permits_automatic_apply() {
             return Err(ToolError::RestartNotReady(readiness_explanation(
                 &readiness,
@@ -961,9 +1060,8 @@ impl ToolSupervisor {
         }
         let preparation: RestartPreparation = self
             .client
-            .post(format!(
-                "http://127.0.0.1:{CONTROL_PORT}/_lan/control/prepare-restart"
-            ))
+            .post(control_url(port, "/_lan/control/prepare-restart"))
+            .timeout(Duration::from_millis(400))
             .json(&ToolIdRequest {
                 tool_id: self.spec.identity.tool_id,
             })
@@ -972,16 +1070,15 @@ impl ToolSupervisor {
             .error_for_status()?
             .json()
             .await?;
-        let readiness = self.readiness().await?;
+        let readiness = self.readiness_on(port).await?;
         if !readiness.permits_automatic_apply() {
             return Err(ToolError::RestartNotReady(readiness_explanation(
                 &readiness,
             )));
         }
         self.client
-            .post(format!(
-                "http://127.0.0.1:{CONTROL_PORT}/_lan/control/shutdown"
-            ))
+            .post(control_url(port, "/_lan/control/shutdown"))
+            .timeout(Duration::from_millis(400))
             .json(&ShutdownRequest {
                 tool_id: self.spec.identity.tool_id,
                 nonce: preparation.nonce,
@@ -991,7 +1088,14 @@ impl ToolSupervisor {
             .error_for_status()?;
         for _ in 0..40 {
             sleep(Duration::from_millis(125)).await;
-            if self.probe().await.is_err() {
+            if self
+                .client
+                .get(control_url(port, "/healthz"))
+                .timeout(Duration::from_millis(400))
+                .send()
+                .await
+                .is_err()
+            {
                 *self.child.lock().await = None;
                 return Ok(());
             }
@@ -1034,7 +1138,8 @@ impl ToolSupervisor {
     }
 
     pub async fn receive_lan_update(&self, timeout: Duration) -> Result<PendingUpdate, ToolError> {
-        let manifest = receive_lan_manifest(timeout).await?;
+        let receiver = LanManifestReceiver::bind(self.spec.identity.tool_id).await?;
+        let manifest = receiver.receive(timeout).await?;
         self.stage_update(manifest).await
     }
 
@@ -1070,20 +1175,66 @@ impl ToolSupervisor {
     }
 }
 
-pub async fn receive_lan_manifest(timeout: Duration) -> Result<UpdateManifest, ToolError> {
-    let socket = UdpSocket::bind(("0.0.0.0", LAN_DEV_PORT)).await?;
-    receive_lan_manifest_from(socket, timeout).await
+fn control_url(port: u16, path: &str) -> String {
+    format!("http://127.0.0.1:{port}{path}")
 }
 
-async fn receive_lan_manifest_from(
+fn available_control_port(tool_id: Uuid) -> Option<u16> {
+    control_port_candidates(tool_id)
+        .into_iter()
+        .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
+}
+
+#[cfg(windows)]
+fn hide_command_window(command: &mut Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_command_window(_command: &mut Command) {}
+
+pub struct LanManifestReceiver {
     socket: UdpSocket,
-    timeout: Duration,
-) -> Result<UpdateManifest, ToolError> {
-    let mut data = [0_u8; 16 * 1024];
-    let received = tokio::time::timeout(timeout, socket.recv_from(&mut data))
-        .await
-        .map_err(|_| ToolError::LanDevTimedOut)??;
-    Ok(serde_json::from_slice(&data[..received.0])?)
+    port: u16,
+    tool_id: Uuid,
+}
+
+impl LanManifestReceiver {
+    pub async fn bind(tool_id: Uuid) -> Result<Self, ToolError> {
+        for port in lan_discovery_ports(tool_id) {
+            if let Ok(socket) = UdpSocket::bind(("0.0.0.0", port)).await {
+                return Ok(Self {
+                    socket,
+                    port,
+                    tool_id,
+                });
+            }
+        }
+        Err(ToolError::LanDiscoveryPortsUnavailable)
+    }
+
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub async fn receive(&self, timeout: Duration) -> Result<UpdateManifest, ToolError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut data = [0_u8; 16 * 1024];
+        loop {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .ok_or(ToolError::LanDevTimedOut)?;
+            let received = tokio::time::timeout(remaining, self.socket.recv_from(&mut data))
+                .await
+                .map_err(|_| ToolError::LanDevTimedOut)??;
+            let manifest: UpdateManifest = serde_json::from_slice(&data[..received.0])?;
+            if manifest.tool_id == self.tool_id {
+                return Ok(manifest);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -1092,8 +1243,12 @@ pub enum ToolError {
     ToolFileNotFound,
     #[error("本机没有可用的数据目录")]
     NoDataDirectory,
-    #[error("当前 8765 端口由其他工具占用")]
+    #[error("没有发现当前工具的运行中服务")]
+    ServiceUnavailable,
+    #[error("控制端响应属于其他工具")]
     DifferentTool,
+    #[error("当前工具的本机控制端口候选均被占用")]
+    ControlPortsUnavailable,
     #[error("未找到服务端二进制：{0}")]
     ServerBinaryMissing(PathBuf),
     #[error("服务在等待时间内没有通过健康检查")]
@@ -1104,6 +1259,8 @@ pub enum ToolError {
     RestartNotReady(String),
     #[error("等待 LAN Dev 广播超时")]
     LanDevTimedOut,
+    #[error("当前工具的 LAN Dev 发现端口候选均被占用")]
+    LanDiscoveryPortsUnavailable,
     #[error("I/O 错误：{0}")]
     Io(#[from] io::Error),
     #[error("网络错误：{0}")]
@@ -1354,6 +1511,10 @@ mod tests {
             }],
         )
         .expect("bundle");
+        let mut archive =
+            ZipArchive::new(fs::File::open(&bundle).expect("open bundle")).expect("read bundle");
+        assert!(archive.by_name("bin/web/index.html").is_ok());
+        drop(archive);
         let payload = fs::read(&bundle).expect("payload");
         let manifest = UpdateManifest {
             tool_id: id,
@@ -1547,9 +1708,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lan_manifest_is_received_before_tool_identity_is_accepted() {
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("receiver");
-        let address = receiver.local_addr().expect("receiver address");
+    async fn lan_manifest_receiver_ignores_other_tools() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("receiver");
+        let address = socket.local_addr().expect("receiver address");
+        let expected_tool_id = Uuid::new_v4();
+        let receiver = LanManifestReceiver {
+            socket,
+            port: address.port(),
+            tool_id: expected_tool_id,
+        };
         let foreign = UpdateManifest {
             tool_id: Uuid::new_v4(),
             version: Version::new(1, 0, 1),
@@ -1570,19 +1737,62 @@ mod tests {
             )
             .await
             .expect("send manifest");
-        let received = receive_lan_manifest_from(receiver, Duration::from_secs(1))
+        let matching = UpdateManifest {
+            tool_id: expected_tool_id,
+            ..foreign.clone()
+        };
+        UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("sender")
+            .send_to(
+                &serde_json::to_vec(&matching).expect("manifest json"),
+                address,
+            )
+            .await
+            .expect("send matching manifest");
+        let received = receiver
+            .receive(Duration::from_secs(1))
             .await
             .expect("receive manifest");
-        let store = UpdateStore {
-            paths: ToolPaths {
-                root: tempfile::TempDir::new().expect("state").keep(),
-            },
-            tool_id: Uuid::new_v4(),
-            target: "test-target".to_owned(),
-        };
-        assert!(matches!(
-            store.validate_manifest(&received),
-            Err(UpdateError::ToolIdMismatch)
-        ));
+        assert_eq!(received.tool_id, expected_tool_id);
+    }
+
+    #[test]
+    fn tool_ports_are_stable_unique_and_in_their_ranges() {
+        let tool_id = Uuid::parse_str("f283347b-6699-4940-911e-e41d968937f3").unwrap();
+        let control = control_port_candidates(tool_id);
+        let business = business_port_candidates(tool_id);
+        let discovery = lan_discovery_ports(tool_id);
+
+        assert_eq!(control, control_port_candidates(tool_id));
+        assert_eq!(business, business_port_candidates(tool_id));
+        assert_eq!(discovery, lan_discovery_ports(tool_id));
+        for (ports, range) in [
+            (&control, CONTROL_PORT_RANGE),
+            (&business, BUSINESS_PORT_RANGE),
+            (&discovery, LAN_DISCOVERY_PORT_RANGE),
+        ] {
+            assert_eq!(ports.len(), PORT_CANDIDATE_COUNT);
+            assert_eq!(
+                ports
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                PORT_CANDIDATE_COUNT
+            );
+            assert!(ports.iter().all(|port| (range.0..=range.1).contains(port)));
+        }
+    }
+
+    #[tokio::test]
+    async fn lan_receivers_for_different_tools_can_bind_together() {
+        let first = LanManifestReceiver::bind(Uuid::new_v4())
+            .await
+            .expect("first receiver");
+        let second = LanManifestReceiver::bind(Uuid::new_v4())
+            .await
+            .expect("second receiver");
+        assert_ne!(first.port(), second.port());
     }
 }

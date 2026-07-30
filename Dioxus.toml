@@ -12,4 +12,4 @@ reload_html = true
 
 # dx serve 开发热更新：SPA 用同源相对路径调 /api/*，由 dev server 代理到真实服务端
 [[web.proxy]]
-backend = "http://127.0.0.1:8765/api"
+backend = "http://127.0.0.1:44588/api"
