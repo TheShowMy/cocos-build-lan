@@ -11,8 +11,13 @@ web = ["dioxus/web", "dioxus/document"]
 
 [dependencies]
 dioxus.workspace = true
+dioxus-router.workspace = true
+dioxus-free-icons = { version = "0.10.0", features = ["lucide"] }
+gloo-net = "0.7.0"
+gloo-timers = { version = "0.3.0", features = ["futures"] }
+serde.workspace = true
 serde_json.workspace = true
-web-sys = { version = "0.3", features = ["Location"] }
+web-sys = { version = "0.3", features = ["Location", "Storage"] }
 
 [[bin]]
 name = "cocos-build-lan"

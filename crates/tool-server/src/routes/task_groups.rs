@@ -39,7 +39,7 @@ async fn create_task_group(
     State(state): State<AppState>,
     Json(request): Json<TaskGroupRequest>,
 ) -> Result<Json<TaskGroup>, AppError> {
-    validate_group_request(&state, &request).await?;
+    validate_group_request(&state, &request, None).await?;
     let mut settings = state.get_settings().await;
     let order = settings
         .task_groups
@@ -48,12 +48,27 @@ async fn create_task_group(
         .max()
         .unwrap_or(0)
         .saturating_add(1);
+    let params = if let Some(source_id) = request
+        .copy_from_group_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
+        settings
+            .task_groups
+            .iter()
+            .find(|group| group.id == source_id)
+            .map(|group| group.params.clone())
+            .ok_or_else(|| AppError::not_found(format!("未找到源任务组 {source_id}")))?
+    } else {
+        request.params
+    };
     let group = TaskGroup {
         id: format!("group_{}", uuid::Uuid::new_v4().simple()),
         project_id: request.project_id.trim().to_owned(),
         name: request.name.trim().to_owned(),
+        description: request.description.trim().to_owned(),
         branch: request.branch.trim().to_owned(),
-        params: normalize_params(&settings.param_definitions, request.params)?,
+        params: normalize_params(&settings.param_definitions, params)?,
         order,
     };
     settings.task_groups.push(group.clone());
@@ -66,7 +81,7 @@ async fn update_task_group(
     Path(group_id): Path<String>,
     Json(request): Json<TaskGroupRequest>,
 ) -> Result<Json<TaskGroup>, AppError> {
-    validate_group_request(&state, &request).await?;
+    validate_group_request(&state, &request, Some(&group_id)).await?;
     let mut settings = state.get_settings().await;
     let definitions = settings.param_definitions.clone();
     let group = settings
@@ -76,9 +91,21 @@ async fn update_task_group(
         .ok_or_else(|| AppError::not_found(format!("未找到任务组 {group_id}")))?;
     group.project_id = request.project_id.trim().to_owned();
     group.name = request.name.trim().to_owned();
+    group.description = request.description.trim().to_owned();
     group.branch = request.branch.trim().to_owned();
     group.params = normalize_params(&definitions, request.params)?;
     let result = group.clone();
+    for task in settings
+        .package_tasks
+        .iter_mut()
+        .filter(|task| task.task_group_id == group_id)
+    {
+        task.group = result.name.clone();
+        task.project = Some(crate::models::TaskProjectConfig {
+            project_id: result.project_id.clone(),
+            branch: result.branch.clone(),
+        });
+    }
     state.save_settings(settings).await?;
     Ok(Json(result))
 }
@@ -101,6 +128,16 @@ async fn update_task_group_params(
     group.branch = request.branch.trim().to_owned();
     group.params = normalize_params(&definitions, request.params)?;
     let result = group.clone();
+    for task in settings
+        .package_tasks
+        .iter_mut()
+        .filter(|task| task.task_group_id == group_id)
+    {
+        task.project = Some(crate::models::TaskProjectConfig {
+            project_id: result.project_id.clone(),
+            branch: result.branch.clone(),
+        });
+    }
     state.save_settings(settings).await?;
     Ok(Json(result))
 }
@@ -109,15 +146,33 @@ async fn delete_task_group(
     State(state): State<AppState>,
     Path(group_id): Path<String>,
 ) -> Result<axum::http::StatusCode, AppError> {
-    let mut settings = state.get_settings().await;
-    let before = settings.task_groups.len();
-    settings.task_groups.retain(|group| group.id != group_id);
-    if settings.task_groups.len() == before {
+    let settings = state.get_settings().await;
+    if !settings
+        .task_groups
+        .iter()
+        .any(|group| group.id == group_id)
+    {
         return Err(AppError::not_found(format!("未找到任务组 {group_id}")));
     }
-    settings
+    let task_ids = settings
         .package_tasks
-        .retain(|task| task.task_group_id != group_id);
+        .iter()
+        .filter(|task| task.task_group_id == group_id)
+        .map(|task| task.id.clone())
+        .collect::<Vec<_>>();
+    for task_id in &task_ids {
+        let runtime = state.get_task_runtime(task_id).await?;
+        if runtime.status == crate::models::PackageTaskStatus::Running
+            || runtime.status == crate::models::PackageTaskStatus::Canceling
+        {
+            return Err(AppError::conflict("任务组内存在运行中任务，无法删除"));
+        }
+    }
+    for task_id in task_ids {
+        crate::services::package_tasks::delete_task(&state, &task_id).await?;
+    }
+    let mut settings = state.get_settings().await;
+    settings.task_groups.retain(|group| group.id != group_id);
     state.save_settings(settings).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -125,6 +180,7 @@ async fn delete_task_group(
 async fn validate_group_request(
     state: &AppState,
     request: &TaskGroupRequest,
+    current_group_id: Option<&str>,
 ) -> Result<(), AppError> {
     if request.name.trim().is_empty() {
         return Err(AppError::validation("任务组名称不能为空"));
@@ -133,6 +189,19 @@ async fn validate_group_request(
         return Err(AppError::validation("任务组分支不能为空"));
     }
     state.find_project(request.project_id.trim()).await?;
+    let duplicate = state
+        .get_settings()
+        .await
+        .task_groups
+        .into_iter()
+        .any(|group| {
+            Some(group.id.as_str()) != current_group_id
+                && group.project_id == request.project_id.trim()
+                && group.name.eq_ignore_ascii_case(request.name.trim())
+        });
+    if duplicate {
+        return Err(AppError::conflict("同一项目下的任务组名称不能重复"));
+    }
     Ok(())
 }
 
@@ -286,6 +355,79 @@ mod tests {
         let settings = state.get_settings().await;
         assert!(settings.task_groups.is_empty());
         assert!(settings.package_tasks.is_empty());
+
+        let _ = tokio::fs::remove_dir_all(data_dir).await;
+    }
+
+    #[tokio::test]
+    async fn creating_group_can_copy_only_source_params() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "cocos_build_group_copy_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let state = AppState::load(data_dir.clone()).await;
+        state
+            .save_settings(AppSettings {
+                projects: vec![Project {
+                    id: "project_1".to_owned(),
+                    workspace_dir_key: "workspace_1".to_owned(),
+                    name: "项目".to_owned(),
+                    ..Project::default()
+                }],
+                param_definitions: vec![ParamDefinition {
+                    key: "channel".to_owned(),
+                    label: "渠道".to_owned(),
+                    default_value: Value::String("default".to_owned()),
+                    ..ParamDefinition::default()
+                }],
+                task_groups: vec![TaskGroup {
+                    id: "group_source".to_owned(),
+                    project_id: "project_1".to_owned(),
+                    name: "源组".to_owned(),
+                    description: "源描述".to_owned(),
+                    branch: "source".to_owned(),
+                    params: BTreeMap::from([(
+                        "channel".to_owned(),
+                        Value::String("copied".to_owned()),
+                    )]),
+                    order: 0,
+                }],
+                ..AppSettings::default()
+            })
+            .await
+            .unwrap();
+        let app: Router = router().with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/task-groups")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "projectId": "project_1",
+                            "name": "目标组",
+                            "description": "目标描述",
+                            "branch": "target",
+                            "copyFromGroupId": "group_source"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let group: TaskGroup = serde_json::from_slice(&body).unwrap();
+        assert_eq!(group.description, "目标描述");
+        assert_eq!(group.branch, "target");
+        assert_eq!(group.params["channel"], Value::String("copied".to_owned()));
 
         let _ = tokio::fs::remove_dir_all(data_dir).await;
     }

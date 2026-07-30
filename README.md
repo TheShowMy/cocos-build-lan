@@ -90,6 +90,8 @@ rustup toolchain install nightly
 powershell -ExecutionPolicy Bypass -File scripts/build-windows-release.ps1
 ```
 
+发布脚本使用锁定的 pnpm 依赖在开发机离线打包 CodeMirror 6；部署机不需要 Node 或 pnpm。
+
 1. 推送 `v*` tag 会触发 `.github/workflows/release.yml`，发布当前平台的 `bootstrap.zip`、`update.zip` 和 `manifest.json`。
 2. 将 `bootstrap.zip` 解压到干净目录后，只启动根目录 `cocos-build-lan.exe`。同一 `tool_id` 会继续使用本机应用数据目录中的配置和业务数据。
 3. 在控制端“设置”页填写 Release 清单 URL。控制端每六小时检查一次，也可在“更新”页立即检查；下载时校验工具 ID、包格式、平台、大小和 SHA-256。
@@ -103,7 +105,7 @@ $env:__COMPAT_LAYER = "RunAsInvoker"
 cargo run -p cocos-build-lan-core --bin tool-dev-update -- `
   tool.json target/release/cocos-build-lan-server.exe target/release/cocos-build-lan-control.exe `
   --web dist/bootstrap/bin/web --scripts dist/bootstrap/bin/scripts `
-  --listen lan --advertise 192.168.1.24 --broadcast --version 0.1.1-dev.1
+  --listen lan --advertise 192.168.2.7 --broadcast --version 0.1.2
 ```
 
 只有在设置页打开并保存“接收可信局域网的 LAN Dev 完整版本包”后，控制端才会创建持久后台监听器。控制 TCP、默认业务 TCP 和 LAN 更新 UDP 候选都由不可变 `tool_id` 派生并自动避让，因此同机多个工具不会争用固定端口。发送器的 HTTP 端口由系统动态分配；广播仍先过滤来源、工具 ID、平台、包格式和重复版本，再下载校验。

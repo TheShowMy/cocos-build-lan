@@ -43,6 +43,19 @@ pub struct PublicSettings {
     pub git_credentials_configured: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicSettingsUpdate {
+    #[serde(default)]
+    pub engines: Vec<Engine>,
+    #[serde(default)]
+    pub projects: Vec<Project>,
+    #[serde(default)]
+    pub feishu_bots: Vec<FeishuBotConfig>,
+    #[serde(default)]
+    pub param_definitions: Vec<ParamDefinition>,
+}
+
 impl From<&AppSettings> for PublicSettings {
     fn from(value: &AppSettings) -> Self {
         Self {
@@ -55,18 +68,6 @@ impl From<&AppSettings> for PublicSettings {
             git_credentials_configured: !value.git_config.username.trim().is_empty()
                 || !value.git_config.password.trim().is_empty(),
         }
-    }
-}
-
-impl PublicSettings {
-    pub fn merge_into(self, mut existing: AppSettings) -> AppSettings {
-        existing.engines = self.engines;
-        existing.projects = self.projects;
-        existing.feishu_bots = self.feishu_bots;
-        existing.package_tasks = self.package_tasks;
-        existing.task_groups = self.task_groups;
-        existing.param_definitions = self.param_definitions;
-        existing
     }
 }
 
@@ -168,6 +169,8 @@ pub struct TaskGroup {
     pub id: String,
     pub project_id: String,
     pub name: String,
+    #[serde(default)]
+    pub description: String,
     pub branch: String,
     #[serde(default)]
     pub params: BTreeMap<String, Value>,
@@ -476,9 +479,13 @@ pub struct BuildStopResponse {
 pub struct TaskGroupRequest {
     pub project_id: String,
     pub name: String,
+    #[serde(default)]
+    pub description: String,
     pub branch: String,
     #[serde(default)]
     pub params: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub copy_from_group_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -487,6 +494,40 @@ pub struct TaskGroupParamsRequest {
     pub branch: String,
     #[serde(default)]
     pub params: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageTaskRequest {
+    pub name: String,
+    pub task_group_id: String,
+    #[serde(default)]
+    pub code_repo_url: String,
+    #[serde(default)]
+    pub asset_repo_url: String,
+    #[serde(default = "default_build_args_json")]
+    pub build_args_json: String,
+    #[serde(default)]
+    pub enable_obfuscation: bool,
+    #[serde(default)]
+    pub obfuscation_mode: ObfuscationMode,
+    #[serde(default)]
+    pub obfuscation_seed: Option<u64>,
+    #[serde(default)]
+    pub enable_dead_code_injection: bool,
+    #[serde(default = "default_dead_code_injection_count")]
+    pub dead_code_injection_count: u32,
+    #[serde(default)]
+    pub pre_build_actions: Vec<TaskPrepAction>,
+    #[serde(default)]
+    pub post_build_actions: Vec<TaskPrepAction>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageTaskReorderRequest {
+    pub task_group_id: String,
+    pub task_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -707,6 +748,15 @@ pub struct LogFileInfo {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogPageResponse {
+    pub items: Vec<LogFileInfo>,
+    pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct RepoSyncResult {
     pub path: std::path::PathBuf,
@@ -716,6 +766,10 @@ pub struct RepoSyncResult {
 
 fn default_version() -> String {
     "1.0.0".to_string()
+}
+
+fn default_build_args_json() -> String {
+    "{}".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]

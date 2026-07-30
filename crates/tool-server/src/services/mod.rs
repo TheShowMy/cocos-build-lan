@@ -6,3 +6,4 @@ pub mod package_tasks;
 pub mod placeholders;
 pub mod preps;
 pub mod projects;
+pub mod settings;

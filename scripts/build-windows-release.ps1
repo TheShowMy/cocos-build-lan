@@ -28,8 +28,20 @@ try {
     if (-not (Get-Command dx -ErrorAction SilentlyContinue)) {
         throw "Missing dioxus-cli. Run: cargo install dioxus-cli --locked"
     }
+    if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) {
+        throw "Missing pnpm. Install pnpm before building the release."
+    }
 
     $env:CI = "true"
+    pnpm --dir crates/tool-app/editor install --frozen-lockfile
+    if ($LASTEXITCODE -ne 0) { throw "CodeMirror dependency installation failed." }
+    pnpm --dir crates/tool-app/editor run build
+    if ($LASTEXITCODE -ne 0) { throw "CodeMirror bundle build failed." }
+    $editorBundle = Join-Path $projectRoot "crates\tool-app\assets\editor.bundle.js"
+    if (-not (Test-Path -LiteralPath $editorBundle)) {
+        throw "CodeMirror bundle is missing: $editorBundle"
+    }
+
     $webSource = Join-Path $projectRoot "target\dx\cocos-build-lan\release\web\public"
     if (Test-Path -LiteralPath $webSource) {
         Remove-Item -LiteralPath $webSource -Recurse -Force

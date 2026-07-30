@@ -12,9 +12,10 @@ $env:__COMPAT_LAYER = "RunAsInvoker"
 cargo run -p cocos-build-lan-core --bin tool-dev-update -- `
   tool.json target/release/cocos-build-lan-server.exe target/release/cocos-build-lan-control.exe `
   --web dist/bootstrap/bin/web --scripts dist/bootstrap/bin/scripts `
-  --listen lan --advertise 192.168.1.24 --broadcast --version 0.1.1-dev.1
+  --listen lan --advertise 192.168.2.7 --broadcast --version 0.1.2
 ```
 
+- 发布脚本先按 `crates/tool-app/editor/pnpm-lock.yaml` 构建离线 CodeMirror 6 bundle，再构建 Dioxus Web；部署机不需要 Node 或 pnpm。
 - HTTP 下载端口由系统动态分配并写入 manifest；同机可同时运行多个发送器。
 - `--web` 与 `--scripts` 必填，确保切换后的版本仍包含完整页面和 AST 混淆运行资源。
 - `--listen lan` 必须配对 `--advertise <LAN IPv4>`，让其他机器能下载清单内的载荷 URL。
