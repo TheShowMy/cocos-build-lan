@@ -1,0 +1,42 @@
+[workspace]
+members = [
+    "crates/tool-core",
+    "crates/tool-app",
+    "crates/tool-contract",
+    "crates/tool-control",
+    "crates/tool-server",
+    "crates/obfuscation-cli",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.97.1"
+
+[workspace.dependencies]
+axum = "0.8.9"
+base64 = "0.22.1"
+chrono = "0.4.42"
+directories = "6.0.0"
+dioxus = { version = "0.7.3", default-features = false, features = ["minimal"] }
+dioxus-desktop = "0.7.3"
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+semver = { version = "1.0.27", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+thiserror = "2.0.18"
+tokio = { version = "1.49.0", features = ["full"] }
+tower-http = { version = "0.6.6", features = ["cors", "fs"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["chrono", "env-filter", "fmt"] }
+uuid = { version = "1.18.1", features = ["serde", "v4"] }
+walkdir = "2.5.0"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+
+# release 剥离 DWARF 调试信息：wasm 里的 DWARFv5 会让 dx 内置 wasm-opt 崩溃（SIGABRT），
+# 对服务端/控制端的 release 二进制也是常规做法。
+[profile.release]
+strip = "debuginfo"

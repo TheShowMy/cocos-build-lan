@@ -1,0 +1,20 @@
+[package]
+name = "cocos-build-lan-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["web"]
+web = ["dioxus/web", "dioxus/document"]
+
+[dependencies]
+dioxus.workspace = true
+serde_json.workspace = true
+web-sys = { version = "0.3", features = ["Location"] }
+
+[[bin]]
+name = "cocos-build-lan"
+path = "src/main.rs"
+required-features = ["web"]

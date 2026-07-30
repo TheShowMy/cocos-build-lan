@@ -1,0 +1,75 @@
+name: 发布完整版本包
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos-tool-bundle:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: 安装 dioxus-cli
+        run: cargo install dioxus-cli --locked
+      - name: 构建同源 Dioxus Web SPA
+        run: |
+          chmod +x scripts/build-web.sh
+          scripts/build-web.sh
+      - name: 构建服务端、控制端和稳定启动器
+        run: |
+          cargo build --release -p cocos-build-lan-server
+          cargo build --release -p cocos-build-lan-control
+          cargo build --release -p cocos-build-lan-core --bin cocos-build-lan-launcher
+      - name: 生成首次安装包和在线更新包
+        run: |
+          set -euo pipefail
+          target="$(rustc -vV | awk -F ': ' '/^host:/{print $2}')"
+          tag="$GITHUB_REF_NAME"
+          name="cocos-build-lan"
+          mkdir -p "dist/update/bin/web" "dist/update/bin/scripts" "dist/bootstrap/web" "dist/bootstrap/scripts"
+          cp "target/release/$name-server" "dist/update/bin/$name-server"
+          cp "target/release/$name-control" "dist/update/bin/$name-control"
+          cp -R "target/dx/cocos-build-lan/release/web/public/." "dist/update/bin/web/"
+          cp -R "crates/tool-server/scripts/." "dist/update/bin/scripts/"
+          cp "target/release/$name-launcher" "dist/bootstrap/$name-launcher"
+          cp "target/release/$name-server" "dist/bootstrap/$name-server"
+          cp "target/release/$name-control" "dist/bootstrap/$name-control"
+          cp -R "target/dx/cocos-build-lan/release/web/public/." "dist/bootstrap/web/"
+          cp -R "crates/tool-server/scripts/." "dist/bootstrap/scripts/"
+          cp tool.json "dist/bootstrap/tool.json"
+          (cd dist/update && zip -qry "../$name-$target-update.zip" bin)
+          (cd dist/bootstrap && zip -qry "../$name-$target-bootstrap.zip" .)
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          tag = os.environ["GITHUB_REF_NAME"]
+          repository = os.environ["GITHUB_REPOSITORY"]
+          target = os.popen("rustc -vV | awk -F ': ' '/^host:/{print $2}'").read().strip()
+          name = "cocos-build-lan"
+          bundle = pathlib.Path(f"dist/{name}-{target}-update.zip")
+          tool = json.loads(pathlib.Path("tool.json").read_text())
+          manifest = {
+              "tool_id": tool["tool_id"],
+              "version": tag.lstrip("v"),
+              "source": "release",
+              "format": "tool-bundle-v1",
+              "target": target,
+              "url": f"https://github.com/{repository}/releases/download/{tag}/{bundle.name}",
+              "size": bundle.stat().st_size,
+              "sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+              "notes": f"Release {tag}",
+          }
+          pathlib.Path("dist/manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: $GITHUB_TOKEN
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/cocos-build-lan-*-bootstrap.zip \
+            dist/cocos-build-lan-*-update.zip \
+            dist/manifest.json --generate-notes
