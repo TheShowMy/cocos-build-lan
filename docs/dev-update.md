@@ -12,7 +12,7 @@ $env:__COMPAT_LAYER = "RunAsInvoker"
 cargo run -p cocos-build-lan-core --bin tool-dev-update -- `
   tool.json target/release/cocos-build-lan-server.exe target/release/cocos-build-lan-control.exe `
   --web dist/bootstrap/bin/web --scripts dist/bootstrap/bin/scripts `
-  --listen lan --advertise 192.168.2.7 --broadcast --version 0.1.2
+  --listen lan --advertise 192.168.2.7 --broadcast --version 0.1.3
 ```
 
 - 发布脚本先按 `crates/tool-app/editor/pnpm-lock.yaml` 构建离线 CodeMirror 6 bundle，再构建 Dioxus Web；部署机不需要 Node 或 pnpm。

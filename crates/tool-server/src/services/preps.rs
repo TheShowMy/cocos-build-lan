@@ -1366,6 +1366,27 @@ mod tests {
     }
 
     #[test]
+    fn build_prep_args_should_inject_context_project_path_and_ignore_override() {
+        let prep_project = PrepProject {
+            id: "1".to_string(),
+            name: "demo".to_string(),
+            path: "/tmp/demo".to_string(),
+            description: String::new(),
+            create_time: "2026-03-21 00:00:00".to_string(),
+            params: normalized_prep_params(&[]),
+        };
+        let args = build_prep_args(
+            &prep_project,
+            &HashMap::from([(String::from("project_path"), json!("/override"))]),
+            &sample_context(),
+        )
+        .expect("system project path should be injected");
+
+        assert_eq!(args, ["--project_path", "/project"]);
+        assert!(!args.iter().any(|arg| arg == "/override"));
+    }
+
+    #[test]
     fn build_prep_args_should_reject_invalid_select_value() {
         let prep_project = PrepProject {
             id: "1".to_string(),

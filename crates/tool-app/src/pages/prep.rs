@@ -87,9 +87,9 @@ pub fn Prep() -> Element {
                 div { class: "prep-grid", for prep in preps() {
                     article { class: "card prep-card", key: "{prep.id}",
                         div { class: "card__body",
-                            div { class: "prep-card__title", strong { "{prep.name}" } span { class: "tag tag--mono", "{prep.params.len()} 参数" } }
+                            div { class: "prep-card__title", strong { "{prep.name}" } span { class: "tag tag--mono", "{prep.params.iter().filter(|parameter| !parameter.is_system()).count()} 参数" } }
                             p { class: "prep-card__desc", if prep.description.is_empty() { "暂无说明" } else { "{prep.description}" } }
-                            div { class: "chips", for parameter in &prep.params { span { class: "chip", "{parameter.name}:{param_type_label(&parameter.param_type)}" } } }
+                            div { class: "chips", for parameter in prep.params.iter().filter(|parameter| !parameter.is_system()) { span { class: "chip", "{parameter.name}:{param_type_label(&parameter.param_type)}" } } }
                             div { class: "prep-card__path mono", "{prep.path}" }
                         }
                         div { class: "card__foot",
@@ -118,7 +118,8 @@ pub fn Prep() -> Element {
                             for project in projects() { option { value: "{project.id}", "{project.name}" } }
                         }
                     }
-                    for parameter in prep.params.iter().filter(|parameter| parameter.value_source == PrepValueSource::Runtime) {
+                    p { class: "hint mono", "project_path 由目标项目自动注入" }
+                    for parameter in prep.params.iter().filter(|parameter| parameter.is_user_runtime()) {
                         RuntimeParamField { parameter: parameter.clone(), values: run_values }
                     }
                     if let Some(result) = run_result() {
@@ -172,7 +173,14 @@ fn PrepEditor(
 ) -> Element {
     let context = use_context::<AppContext>();
     let original_id = value.id.clone();
-    let mut draft = use_signal(|| value);
+    let mut draft = use_signal(|| PrepProject {
+        params: value
+            .params
+            .into_iter()
+            .filter(|parameter| !parameter.is_system())
+            .collect(),
+        ..value
+    });
     let mut saving = use_signal(|| false);
     rsx! {
         div { class: "overlay is-open", onclick: move |event| on_close.call(event) }
@@ -183,7 +191,7 @@ fn PrepEditor(
                     div { class: "field", label { class: "field__label", "名称" } input { class: "input", value: "{draft().name}", oninput: move |event| draft.write().name = event.value() } }
                     div { class: "field", label { class: "field__label", "说明" } input { class: "input", value: "{draft().description}", oninput: move |event| draft.write().description = event.value() } }
                 }
-                div { class: "section-heading", strong { "参数定义" } span { class: "spacer" } button { class: "btn btn--sm", onclick: move |_| { let next = draft().params.len() + 1; draft.write().params.push(PrepParam { name: format!("param_{next}"), ..PrepParam::default() }); }, Icon { width: 14, height: 14, icon: LdPlus } "添加参数" } }
+                div { class: "section-heading", strong { "参数定义" } span { class: "hint mono", "系统自动注入 project_path" } span { class: "spacer" } button { class: "btn btn--sm", onclick: move |_| { let next = draft().params.len() + 1; draft.write().params.push(PrepParam { name: format!("param_{next}"), ..PrepParam::default() }); }, Icon { width: 14, height: 14, icon: LdPlus } "添加参数" } }
                 if draft().params.is_empty() { div { class: "empty-inline", "无参数；脚本将直接执行。" } }
                 for (index, parameter) in draft().params.iter().cloned().enumerate() {
                     PrepParamRow { index, parameter, draft }
@@ -254,7 +262,7 @@ fn RuntimeParamField(parameter: PrepParam, values: Signal<HashMap<String, Value>
 fn default_run_values(prep: &PrepProject) -> HashMap<String, Value> {
     prep.params
         .iter()
-        .filter(|parameter| parameter.value_source == PrepValueSource::Runtime)
+        .filter(|parameter| parameter.is_user_runtime())
         .map(|parameter| {
             let value = match parameter.param_type {
                 PrepParamType::Bool => Value::Bool(false),
@@ -394,6 +402,10 @@ mod tests {
         let prep = PrepProject {
             params: vec![
                 PrepParam {
+                    name: "project_path".to_owned(),
+                    ..PrepParam::default()
+                },
+                PrepParam {
                     name: "enabled".to_owned(),
                     param_type: PrepParamType::Bool,
                     ..PrepParam::default()
@@ -419,6 +431,7 @@ mod tests {
         let values = default_run_values(&prep);
         assert_eq!(values.get("enabled"), Some(&Value::Bool(false)));
         assert_eq!(values.get("channel"), Some(&json!("stable")));
+        assert!(!values.contains_key("project_path"));
         assert!(!values.contains_key("fixed"));
     }
 

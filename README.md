@@ -105,7 +105,7 @@ $env:__COMPAT_LAYER = "RunAsInvoker"
 cargo run -p cocos-build-lan-core --bin tool-dev-update -- `
   tool.json target/release/cocos-build-lan-server.exe target/release/cocos-build-lan-control.exe `
   --web dist/bootstrap/bin/web --scripts dist/bootstrap/bin/scripts `
-  --listen lan --advertise 192.168.2.7 --broadcast --version 0.1.2
+  --listen lan --advertise 192.168.2.7 --broadcast --version 0.1.3
 ```
 
 只有在设置页打开并保存“接收可信局域网的 LAN Dev 完整版本包”后，控制端才会创建持久后台监听器。控制 TCP、默认业务 TCP 和 LAN 更新 UDP 候选都由不可变 `tool_id` 派生并自动避让，因此同机多个工具不会争用固定端口。发送器的 HTTP 端口由系统动态分配；广播仍先过滤来源、工具 ID、平台、包格式和重复版本，再下载校验。

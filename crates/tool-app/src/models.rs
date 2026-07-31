@@ -413,6 +413,16 @@ pub struct PrepParam {
     pub fixed_value: Option<Value>,
 }
 
+impl PrepParam {
+    pub fn is_system(&self) -> bool {
+        self.name == "project_path"
+    }
+
+    pub fn is_user_runtime(&self) -> bool {
+        !self.is_system() && self.value_source == PrepValueSource::Runtime
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PrepProject {
@@ -600,5 +610,27 @@ mod tests {
         let value = serde_json::to_value(PublicSettingsUpdate::from(&settings)).unwrap();
         assert!(value.get("packageTasks").is_none());
         assert!(value.get("gitCredentialsConfigured").is_none());
+    }
+
+    #[test]
+    fn prep_param_classification_excludes_system_and_fixed_params() {
+        let project_path = PrepParam {
+            name: "project_path".to_owned(),
+            ..PrepParam::default()
+        };
+        let runtime = PrepParam {
+            name: "channel".to_owned(),
+            ..PrepParam::default()
+        };
+        let fixed = PrepParam {
+            name: "mode".to_owned(),
+            value_source: PrepValueSource::Fixed,
+            ..PrepParam::default()
+        };
+
+        assert!(project_path.is_system());
+        assert!(!project_path.is_user_runtime());
+        assert!(runtime.is_user_runtime());
+        assert!(!fixed.is_user_runtime());
     }
 }

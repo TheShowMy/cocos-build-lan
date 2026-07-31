@@ -16,9 +16,9 @@ use crate::{
     models::{
         BuildStatusResponse, ObfuscationMode, PackageTask, PackageTaskRequest, ParamDefinition,
         ParamKind, PrepParam, PrepParamType, PrepProject, PrepRunForTasksRequest,
-        PrepTaskRunResponse, PrepValueSource, Project, ProjectBranchesResponse, PublicSettings,
-        TaskGroup, TaskGroupParamsRequest, TaskGroupRequest, TaskPrepAction, TaskPrepTarget,
-        TaskStatus, value_text,
+        PrepTaskRunResponse, Project, ProjectBranchesResponse, PublicSettings, TaskGroup,
+        TaskGroupParamsRequest, TaskGroupRequest, TaskPrepAction, TaskPrepTarget, TaskStatus,
+        value_text,
     },
 };
 
@@ -406,7 +406,7 @@ fn TaskEditor(
                 details { summary { "打包前准备" } div { class: "details-body", ActionList { actions: pre_actions, preps: preps.clone(), on_change: move |actions| draft.write().pre_build_actions = actions } } }
                 details { summary { "打包后准备" } div { class: "details-body", ActionList { actions: post_actions, preps, on_change: move |actions| draft.write().post_build_actions = actions } } }
             }
-            div { class: "drawer__foot", button { class: "btn", onclick: move |event| on_cancel.call(event), "取消" } button { class: "btn btn--primary", disabled: saving() || draft().name.trim().is_empty() || draft().task_group_id.is_empty() || !json_valid, onclick: move |event| { let request = draft(); let id = id.clone(); spawn(async move { saving.set(true); let result = if is_new { api::post::<PackageTask, _>("/api/package-tasks", &request).await } else { api::put::<PackageTask, _>(&format!("/api/package-tasks/{id}"), &request).await }; match result { Ok(_) => { context.success(if is_new { "任务已创建" } else { "任务已保存" }); on_saved.call(event); }, Err(error) => context.error(error) } saving.set(false); }); }, Icon { width: 15, height: 15, icon: LdSave } if saving() { "保存中…" } else { "保存任务" } } }
+            div { class: "drawer__foot", button { class: "btn", onclick: move |event| on_cancel.call(event), "取消" } button { class: "btn btn--primary", disabled: saving() || draft().name.trim().is_empty() || draft().task_group_id.is_empty() || !json_valid, onclick: move |event| { let mut request = draft(); remove_system_prep_param_values(&mut request.pre_build_actions); remove_system_prep_param_values(&mut request.post_build_actions); let id = id.clone(); spawn(async move { saving.set(true); let result = if is_new { api::post::<PackageTask, _>("/api/package-tasks", &request).await } else { api::put::<PackageTask, _>(&format!("/api/package-tasks/{id}"), &request).await }; match result { Ok(_) => { context.success(if is_new { "任务已创建" } else { "任务已保存" }); on_saved.call(event); }, Err(error) => context.error(error) } saving.set(false); }); }, Icon { width: 15, height: 15, icon: LdSave } if saving() { "保存中…" } else { "保存任务" } } }
         }
     }
 }
@@ -511,7 +511,7 @@ fn PrepTargetEditor(
     rsx! { div { class: "prep-target",
         select { class: "select", value: "{prep_project_id}", onchange: move |event| { update_target(&mut all.write()[index], branch, target_index, |id, values| { *id = event.value(); values.clear(); }); on_change.call(all()); }, option { value: "", "请选择准备项目" } for prep in &preps { option { value: "{prep.id}", "{prep.name}" } } }
         if branch != "single" { button { class: "btn btn--sm btn--danger btn--icon", title: "移除", onclick: move |_| { if let TaskPrepAction::Conditional { on_match_targets, on_mismatch_targets, .. } = &mut all.write()[index] { let targets = if branch == "match" { on_match_targets } else { on_mismatch_targets }; if target_index < targets.len() { targets.remove(target_index); } } on_change.call(all()); }, Icon { width: 13, height: 13, icon: LdX } } }
-        if let Some(prep) = selected_prep { for parameter in prep.params.into_iter().filter(|parameter| parameter.value_source == PrepValueSource::Runtime) { ActionParam { action_index: index, target_index, branch, parameter: parameter.clone(), value: params.get(&parameter.name).cloned().unwrap_or(Value::Null), all, on_change } } }
+        if let Some(prep) = selected_prep { for parameter in prep.params.into_iter().filter(PrepParam::is_user_runtime) { ActionParam { action_index: index, target_index, branch, parameter: parameter.clone(), value: params.get(&parameter.name).cloned().unwrap_or(Value::Null), all, on_change } } }
     } }
 }
 
@@ -553,7 +553,8 @@ fn BatchPrepDialog(
                 div { class: "field", label { class: "field__label", "准备项目" }
                     select { class: "select", value: "{prep_id}", onchange: move |event| { prep_id.set(event.value()); if let Some(prep) = preps.iter().find(|prep| prep.id == prep_id()) { values.set(default_prep_values(prep)); } }, for prep in &preps { option { value: "{prep.id}", "{prep.name}" } } }
                 }
-                if let Some(prep) = prep { for parameter in prep.params.into_iter().filter(|parameter| parameter.value_source == PrepValueSource::Runtime) { BatchPrepParam { parameter, values } } }
+                p { class: "hint mono", "project_path 由每个任务的目标项目自动注入" }
+                if let Some(prep) = prep { for parameter in prep.params.into_iter().filter(PrepParam::is_user_runtime) { BatchPrepParam { parameter, values } } }
                 if let Some(result) = result() {
                     div { class: if result.failed_count == 0 { "result-panel result-panel--ok" } else { "result-panel result-panel--error" },
                         strong { "共 {result.total_count} 项 · 成功 {result.success_count} / 失败 {result.failed_count}" }
@@ -734,7 +735,7 @@ fn update_target(
 fn default_prep_values(prep: &PrepProject) -> HashMap<String, Value> {
     prep.params
         .iter()
-        .filter(|parameter| parameter.value_source == PrepValueSource::Runtime)
+        .filter(|parameter| parameter.is_user_runtime())
         .map(|parameter| {
             let value = match parameter.param_type {
                 PrepParamType::Bool => Value::Bool(false),
@@ -749,6 +750,25 @@ fn default_prep_values(prep: &PrepProject) -> HashMap<String, Value> {
             (parameter.name.clone(), value)
         })
         .collect()
+}
+
+fn remove_system_prep_param_values(actions: &mut [TaskPrepAction]) {
+    for action in actions {
+        match action {
+            TaskPrepAction::Single { params, .. } => {
+                params.remove("project_path");
+            }
+            TaskPrepAction::Conditional {
+                on_match_targets,
+                on_mismatch_targets,
+                ..
+            } => {
+                for target in on_match_targets.iter_mut().chain(on_mismatch_targets) {
+                    target.params.remove("project_path");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -804,6 +824,66 @@ mod tests {
             panic!("expected conditional action");
         };
         assert_eq!(on_match_targets[0].prep_project_id, "new");
+        assert_eq!(
+            on_match_targets[0].params.get("enabled"),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn prep_defaults_and_saved_actions_exclude_project_path() {
+        let prep = PrepProject {
+            params: vec![
+                PrepParam {
+                    name: "project_path".to_owned(),
+                    ..PrepParam::default()
+                },
+                PrepParam {
+                    name: "enabled".to_owned(),
+                    param_type: PrepParamType::Bool,
+                    ..PrepParam::default()
+                },
+            ],
+            ..PrepProject::default()
+        };
+        let defaults = default_prep_values(&prep);
+        assert!(!defaults.contains_key("project_path"));
+        assert_eq!(defaults.get("enabled"), Some(&Value::Bool(false)));
+
+        let values = HashMap::from([
+            ("project_path".to_owned(), json!("C:/user-selected")),
+            ("enabled".to_owned(), json!(true)),
+        ]);
+        let mut actions = vec![
+            TaskPrepAction::Single {
+                prep_project_id: "prep-1".to_owned(),
+                params: values.clone(),
+            },
+            TaskPrepAction::Conditional {
+                condition_source: "channel".to_owned(),
+                condition_equals: "release".to_owned(),
+                on_match_targets: vec![TaskPrepTarget {
+                    prep_project_id: "prep-1".to_owned(),
+                    params: values,
+                }],
+                on_mismatch_targets: Vec::new(),
+            },
+        ];
+
+        remove_system_prep_param_values(&mut actions);
+
+        let TaskPrepAction::Single { params, .. } = &actions[0] else {
+            panic!("expected single action");
+        };
+        assert!(!params.contains_key("project_path"));
+        assert_eq!(params.get("enabled"), Some(&json!(true)));
+        let TaskPrepAction::Conditional {
+            on_match_targets, ..
+        } = &actions[1]
+        else {
+            panic!("expected conditional action");
+        };
+        assert!(!on_match_targets[0].params.contains_key("project_path"));
         assert_eq!(
             on_match_targets[0].params.get("enabled"),
             Some(&json!(true))
