@@ -208,7 +208,7 @@ fn ProjectRow(
             td { span { class: "tag", "{project.engine_name}" } br {} span { class: "hint mono", "{project.git_url}" } }
             td {
                 span { class: if initialized { "tag tag--ok" } else { "tag tag--warn" }, if initialized { "已初始化" } else { "未初始化" } }
-                if let Some(status) = status { p { class: "hint mono path-cell", "{status.project_path}" } }
+                if let Some(status) = status { p { class: "hint mono path-cell", title: "{status.project_path}", "{status.project_path}" } }
             }
             td { div { class: "table__actions",
                 button { class: "btn btn--sm", disabled: busy == project.id, onclick: { let project = project.clone(); move |_| on_initialize.call(project.clone()) }, if initialized { "重新初始化" } else { "初始化" } }

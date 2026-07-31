@@ -229,7 +229,7 @@ fn GroupDetail(
                 button { class: "btn btn--sm btn--danger btn--icon", title: "删除任务组", onclick: move |_| on_delete.call(group.clone()), Icon { width: 14, height: 14, icon: LdTrash2 } }
             }
             div { class: "group-detail__form",
-                div { class: "field", label { class: "field__label", "Git 分支" }
+                div { class: "field field--span-all", label { class: "field__label", "Git 分支" }
                     div { class: "input-action", if branches().is_empty() { input { class: "input input--mono", value: "{draft().branch}", oninput: move |event| draft.write().branch = event.value() } } else { select { class: "select select--mono", value: "{draft().branch}", onchange: move |event| draft.write().branch = event.value(), for branch in branches() { option { value: "{branch}", "{branch}" } } } } button { class: "btn btn--icon", title: "拉取远程分支", disabled: branch_loading(), onclick: load_branches, Icon { width: 15, height: 15, icon: LdGitBranch } } }
                 }
                 for definition in definitions { GroupParamField { definition, draft } }
@@ -296,15 +296,15 @@ fn TaskRow(
         td { class: "check-cell", input { r#type: "checkbox", checked: selected().contains(&task.id), onchange: move |event| { if event.checked() { if !selected().contains(&selection_task_id) { selected.write().push(selection_task_id.clone()); } } else { selected.write().retain(|id| id != &selection_task_id); } } } }
         td { strong { "{task.name}" } if !error.is_empty() { p { class: "task-error", "{error}" } } }
         td { span { class: "tag {status.class()}", "{status.label()}" } }
-        td { div { class: "progress", div { style: "width:{progress}%" } } span { class: "progress__label", if step.is_empty() { "{progress}%" } else { "{step} · {progress}%" } } }
+        td { div { class: "progress-cell", div { class: "progress", div { style: "width:{progress}%" } } span { class: "progress__label", if step.is_empty() { "{progress}%" } else { "{step} · {progress}%" } } } }
         td { div { class: "table__actions",
+            if task.enable_obfuscation { button { class: "btn btn--sm btn--icon", title: "单独执行混淆", disabled: running || busy == task.id, onclick: { let id = task.id.clone(); move |_| run_obfuscation(id.clone(), context) }, Icon { width: 14, height: 14, icon: LdSparkles } } }
             if running { button { class: "btn btn--sm", disabled: status == TaskStatus::Canceling, onclick: { let id = task.id.clone(); move |_| stop_task(id.clone(), context) }, Icon { width: 14, height: 14, icon: LdCircleStop } "停止" } }
             else { button { class: "btn btn--sm btn--primary", onclick: { let id = task.id.clone(); move |_| start_tasks(vec![id.clone()], context, statuses) }, Icon { width: 14, height: 14, icon: LdPlay } "启动" } }
             button { class: "btn btn--sm btn--icon", title: "上移", disabled: index == 0 || running, onclick: { let task_id = task.id.clone(); let tasks = all_tasks.clone(); let group_id = group_id.clone(); move |event| reorder_task(tasks.clone(), &task_id, -1, group_id.clone(), on_refresh, event, context) }, Icon { width: 14, height: 14, icon: LdChevronUp } }
             button { class: "btn btn--sm btn--icon", title: "下移", disabled: index + 1 == total || running, onclick: { let task_id = task.id.clone(); let tasks = all_tasks.clone(); let group_id = group_id.clone(); move |event| reorder_task(tasks.clone(), &task_id, 1, group_id.clone(), on_refresh, event, context) }, Icon { width: 14, height: 14, icon: LdChevronDown } }
             button { class: "btn btn--sm btn--icon", title: "复制", disabled: running, onclick: { let id = task.id.clone(); move |event| duplicate_task(id.clone(), on_refresh, event, context) }, Icon { width: 14, height: 14, icon: LdCopy } }
             button { class: "btn btn--sm btn--icon", title: "编辑", disabled: running, onclick: { let task = task.clone(); move |_| on_edit.call(task.clone()) }, Icon { width: 14, height: 14, icon: LdPencil } }
-            if task.enable_obfuscation { button { class: "btn btn--sm btn--icon", title: "单独执行混淆", disabled: running || busy == task.id, onclick: { let id = task.id.clone(); move |_| run_obfuscation(id.clone(), context) }, Icon { width: 14, height: 14, icon: LdSparkles } } }
             button { class: "btn btn--sm", disabled: running, onclick: { let task = task.clone(); move |_| on_cleanup.call(task.clone()) }, "清理仓库" }
             button { class: "btn btn--sm btn--danger btn--icon", title: "删除", disabled: running, onclick: move |_| on_delete.call(task.clone()), Icon { width: 14, height: 14, icon: LdTrash2 } }
         } }
