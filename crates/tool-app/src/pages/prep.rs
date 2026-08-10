@@ -207,12 +207,6 @@ fn PrepEditor(
 
 #[component]
 fn PrepParamRow(index: usize, parameter: PrepParam, draft: Signal<PrepProject>) -> Element {
-    let options_text = parameter
-        .options
-        .iter()
-        .map(|option| format!("{}={}", option.label, option.value))
-        .collect::<Vec<_>>()
-        .join("\n");
     let fixed_text = parameter
         .fixed_value
         .as_ref()
@@ -226,12 +220,39 @@ fn PrepParamRow(index: usize, parameter: PrepParam, draft: Signal<PrepProject>) 
     rsx! {
         div { class: "param-row",
             div { class: "field", label { class: "field__label", "key" } input { class: "input input--mono", value: "{parameter.name}", oninput: move |event| draft.write().params[index].name = event.value() } }
-            div { class: "field", label { class: "field__label", "类型" } select { class: "select", value: "{param_type_value(&parameter.param_type)}", onchange: move |event| draft.write().params[index].param_type = parse_param_type(&event.value()), option { value: "str", "文本" } option { value: "int", "整数" } option { value: "bool", "开关" } option { value: "select", "选择" } } }
-            div { class: "field", label { class: "field__label", "传参方式" } select { class: "select", value: if parameter.value_source == PrepValueSource::Runtime { "runtime" } else { "fixed" }, onchange: move |event| draft.write().params[index].value_source = if event.value() == "fixed" { PrepValueSource::Fixed } else { PrepValueSource::Runtime }, option { value: "runtime", "运行时传入" } option { value: "fixed", "固定值" } } }
+            div { class: "field", label { class: "field__label", "类型" } select { class: "select", value: "{param_type_value(&parameter.param_type)}", onchange: move |event| set_param_type(&mut draft.write().params[index], parse_param_type(&event.value())), option { value: "str", "文本" } option { value: "int", "整数" } option { value: "bool", "开关" } option { value: "select", "选择" } } }
+            div { class: "field", label { class: "field__label", "传参方式" } select { class: "select", value: if parameter.value_source == PrepValueSource::Runtime { "runtime" } else { "fixed" }, onchange: move |event| set_value_source(&mut draft.write().params[index], if event.value() == "fixed" { PrepValueSource::Fixed } else { PrepValueSource::Runtime }), option { value: "runtime", "运行时传入" } option { value: "fixed", "固定值" } } }
             label { class: "checkbox checkbox--compact", input { r#type: "checkbox", checked: parameter.optional, onchange: move |event| draft.write().params[index].optional = event.checked() } "可选" }
             button { class: "btn btn--sm btn--danger btn--icon", title: "删除参数", onclick: move |_| { draft.write().params.remove(index); }, Icon { width: 14, height: 14, icon: LdTrash2 } }
-            if parameter.param_type == PrepParamType::Select { div { class: "field param-row__wide", label { class: "field__label", "选项（每行 显示名=值）" } textarea { class: "textarea textarea--mono", value: "{options_text}", oninput: move |event| draft.write().params[index].options = parse_options(&event.value()) } } }
-            if parameter.value_source == PrepValueSource::Fixed { div { class: "field param-row__wide", label { class: "field__label", "固定值" } input { class: "input input--mono", value: "{fixed_text}", oninput: move |event| { let kind = draft().params[index].param_type.clone(); draft.write().params[index].fixed_value = Some(parse_param_value(&kind, &event.value())); } } } }
+            if parameter.param_type == PrepParamType::Select {
+                div { class: "field param-row__wide", label { class: "field__label", "预设选项" }
+                    div { class: "select-options",
+                        if parameter.options.is_empty() { div { class: "empty-inline", "请至少添加一个选项" } }
+                        for (option_index, option) in parameter.options.iter().cloned().enumerate() {
+                            div { class: "select-option-row", key: "{option_index}",
+                                input { class: "input", placeholder: "显示文案", value: "{option.label}", oninput: move |event| update_select_option_label(&mut draft.write().params[index], option_index, event.value()) }
+                                input { class: "input input--mono", placeholder: "实际值", value: "{option.value}", oninput: move |event| update_select_option_value(&mut draft.write().params[index], option_index, event.value()) }
+                                button { class: "btn btn--sm btn--danger btn--icon", title: "删除选项", onclick: move |_| remove_select_option(&mut draft.write().params[index], option_index), Icon { width: 14, height: 14, icon: LdTrash2 } }
+                            }
+                        }
+                        button { class: "btn btn--sm select-options__add", onclick: move |_| add_select_option(&mut draft.write().params[index]), Icon { width: 14, height: 14, icon: LdPlus } "添加选项" }
+                    }
+                }
+            }
+            if parameter.value_source == PrepValueSource::Fixed {
+                div { class: "field param-row__wide", label { class: "field__label", "固定值" }
+                    if parameter.param_type == PrepParamType::Select {
+                        select { class: "select", value: "{fixed_text}", onchange: move |event| draft.write().params[index].fixed_value = Some(Value::String(event.value())),
+                            option { value: "", disabled: true, "请选择固定值" }
+                            for option in parameter.options.iter().filter(|option| !option.value.is_empty()) {
+                                option { value: "{option.value}", if option.label.is_empty() { "未命名选项" } else { "{option.label}" } }
+                            }
+                        }
+                    } else {
+                        input { class: "input input--mono", value: "{fixed_text}", oninput: move |event| { let kind = draft().params[index].param_type.clone(); draft.write().params[index].fixed_value = Some(parse_param_value(&kind, &event.value())); } }
+                    }
+                }
+            }
         }
     }
 }
@@ -279,30 +300,93 @@ fn default_run_values(prep: &PrepProject) -> HashMap<String, Value> {
         .collect()
 }
 
-fn parse_options(raw: &str) -> Vec<PrepParamOption> {
-    raw.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
-            }
-            let (label, value) = line.split_once('=').unwrap_or((line, line));
-            Some(PrepParamOption {
-                id: format!("option_{}", uuid_like(label, value)),
-                label: label.trim().to_owned(),
-                value: value.trim().to_owned(),
-            })
-        })
-        .collect()
+fn set_param_type(parameter: &mut PrepParam, param_type: PrepParamType) {
+    parameter.param_type = param_type;
+    if parameter.param_type == PrepParamType::Select {
+        if parameter.options.is_empty() {
+            parameter.options.push(PrepParamOption::default());
+        }
+    } else {
+        parameter.options.clear();
+    }
+
+    if parameter.value_source == PrepValueSource::Fixed {
+        match parameter.param_type {
+            PrepParamType::Bool => parameter.fixed_value = Some(Value::Bool(false)),
+            PrepParamType::Select => reconcile_fixed_select_value(parameter),
+            PrepParamType::Str | PrepParamType::Int => parameter.fixed_value = None,
+        }
+    }
 }
 
-fn uuid_like(left: &str, right: &str) -> String {
-    let mut hash = 1469598103934665603u64;
-    for byte in left.bytes().chain(right.bytes()) {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(1099511628211);
+fn set_value_source(parameter: &mut PrepParam, value_source: PrepValueSource) {
+    parameter.value_source = value_source;
+    if parameter.value_source == PrepValueSource::Runtime {
+        parameter.fixed_value = None;
+        return;
     }
-    format!("{hash:x}")
+
+    match parameter.param_type {
+        PrepParamType::Bool => parameter.fixed_value = Some(Value::Bool(false)),
+        PrepParamType::Select => reconcile_fixed_select_value(parameter),
+        PrepParamType::Str | PrepParamType::Int => parameter.fixed_value = None,
+    }
+}
+
+fn add_select_option(parameter: &mut PrepParam) {
+    parameter.options.push(PrepParamOption::default());
+    reconcile_fixed_select_value(parameter);
+}
+
+fn update_select_option_label(parameter: &mut PrepParam, index: usize, label: String) {
+    if let Some(option) = parameter.options.get_mut(index) {
+        option.label = label;
+    }
+}
+
+fn update_select_option_value(parameter: &mut PrepParam, index: usize, value: String) {
+    let selected = parameter.options.get(index).is_some_and(|option| {
+        parameter.fixed_value.as_ref().and_then(Value::as_str) == Some(option.value.as_str())
+    });
+    if let Some(option) = parameter.options.get_mut(index) {
+        option.value = value.clone();
+    }
+    if selected {
+        parameter.fixed_value = (!value.is_empty()).then_some(Value::String(value));
+    }
+    reconcile_fixed_select_value(parameter);
+}
+
+fn remove_select_option(parameter: &mut PrepParam, index: usize) {
+    if index < parameter.options.len() {
+        parameter.options.remove(index);
+    }
+    reconcile_fixed_select_value(parameter);
+}
+
+fn reconcile_fixed_select_value(parameter: &mut PrepParam) {
+    if parameter.param_type != PrepParamType::Select
+        || parameter.value_source != PrepValueSource::Fixed
+    {
+        return;
+    }
+
+    let current = parameter.fixed_value.as_ref().and_then(Value::as_str);
+    if current.is_some_and(|current| {
+        !current.is_empty()
+            && parameter
+                .options
+                .iter()
+                .any(|option| option.value == current)
+    }) {
+        return;
+    }
+
+    parameter.fixed_value = parameter
+        .options
+        .iter()
+        .find(|option| !option.value.is_empty())
+        .map(|option| Value::String(option.value.clone()));
 }
 
 fn parse_param_value(kind: &PrepParamType, raw: &str) -> Value {
@@ -389,12 +473,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_select_options_and_ignores_blank_lines() {
-        let options = parse_options("正式=release\n\n测试=test");
-        assert_eq!(options.len(), 2);
-        assert_eq!(options[0].label, "正式");
-        assert_eq!(options[0].value, "release");
-        assert_eq!(options[1].value, "test");
+    fn select_type_initializes_and_clears_options() {
+        let mut parameter = PrepParam::default();
+
+        set_param_type(&mut parameter, PrepParamType::Select);
+        assert_eq!(parameter.options, vec![PrepParamOption::default()]);
+
+        set_param_type(&mut parameter, PrepParamType::Str);
+        assert!(parameter.options.is_empty());
+    }
+
+    #[test]
+    fn structured_select_option_edits_keep_fixed_value_consistent() {
+        let mut parameter = PrepParam {
+            param_type: PrepParamType::Select,
+            value_source: PrepValueSource::Fixed,
+            options: vec![
+                PrepParamOption {
+                    label: "正式".to_owned(),
+                    value: "release".to_owned(),
+                    ..PrepParamOption::default()
+                },
+                PrepParamOption {
+                    label: "测试".to_owned(),
+                    value: "test".to_owned(),
+                    ..PrepParamOption::default()
+                },
+            ],
+            fixed_value: Some(json!("test")),
+            ..PrepParam::default()
+        };
+
+        update_select_option_label(&mut parameter, 1, "验收".to_owned());
+        update_select_option_value(&mut parameter, 1, "qa".to_owned());
+        assert_eq!(parameter.options[1].label, "验收");
+        assert_eq!(parameter.fixed_value, Some(json!("qa")));
+
+        add_select_option(&mut parameter);
+        assert_eq!(parameter.options.len(), 3);
+
+        remove_select_option(&mut parameter, 1);
+        assert_eq!(parameter.fixed_value, Some(json!("release")));
+    }
+
+    #[test]
+    fn fixed_source_uses_type_appropriate_default() {
+        let mut parameter = PrepParam {
+            param_type: PrepParamType::Bool,
+            ..PrepParam::default()
+        };
+
+        set_value_source(&mut parameter, PrepValueSource::Fixed);
+        assert_eq!(parameter.fixed_value, Some(Value::Bool(false)));
+
+        set_param_type(&mut parameter, PrepParamType::Select);
+        assert_eq!(parameter.options, vec![PrepParamOption::default()]);
+        assert_eq!(parameter.fixed_value, None);
+
+        update_select_option_value(&mut parameter, 0, "stable".to_owned());
+        assert_eq!(parameter.fixed_value, Some(json!("stable")));
+
+        set_value_source(&mut parameter, PrepValueSource::Runtime);
+        assert_eq!(parameter.fixed_value, None);
     }
 
     #[test]

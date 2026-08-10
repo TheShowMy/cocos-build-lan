@@ -24,6 +24,7 @@ use crate::{
         LegacyImportPreview, PackageTask, PackageTaskRuntime, PackageTaskStatus, ParamDefinition,
         ParamKind, Project, RuntimeState, TaskGroup,
     },
+    services::settings::normalize_integral_number,
 };
 use cocos_build_lan_contract::ToolStatus;
 use cocos_build_lan_core::{RestartBlocker, RestartGuard, RestartProtection, RestartRegistry};
@@ -755,6 +756,28 @@ fn normalize_settings(mut settings: AppSettings) -> (AppSettings, bool) {
         changed = true;
     }
 
+    let numeric_keys = settings
+        .param_definitions
+        .iter_mut()
+        .filter_map(|definition| {
+            (definition.kind == ParamKind::Number).then(|| {
+                if normalize_integral_number(&mut definition.default_value) {
+                    changed = true;
+                }
+                definition.key.clone()
+            })
+        })
+        .collect::<HashSet<_>>();
+    for group in &mut settings.task_groups {
+        for key in &numeric_keys {
+            if let Some(value) = group.params.get_mut(key)
+                && normalize_integral_number(value)
+            {
+                changed = true;
+            }
+        }
+    }
+
     let project_by_id = settings
         .projects
         .iter()
@@ -1254,6 +1277,32 @@ mod tests {
         assert_eq!(
             normalized.package_tasks[1].status,
             PackageTaskStatus::Pending
+        );
+    }
+
+    #[test]
+    fn normalize_settings_should_convert_integral_float_params_to_integers() {
+        let settings = AppSettings {
+            param_definitions: vec![ParamDefinition {
+                key: "minor_version".to_owned(),
+                kind: ParamKind::Number,
+                default_value: json!(0.0),
+                ..ParamDefinition::default()
+            }],
+            task_groups: vec![TaskGroup {
+                params: BTreeMap::from([("minor_version".to_owned(), json!(7.0))]),
+                ..TaskGroup::default()
+            }],
+            ..AppSettings::default()
+        };
+
+        let (normalized, changed) = normalize_settings(settings);
+
+        assert!(changed);
+        assert_eq!(normalized.param_definitions[0].default_value, json!(0));
+        assert_eq!(
+            normalized.task_groups[0].params.get("minor_version"),
+            Some(&json!(7))
         );
     }
 

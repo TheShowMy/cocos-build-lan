@@ -18,7 +18,7 @@ use crate::{
         ParamKind, PrepParam, PrepParamType, PrepProject, PrepRunForTasksRequest,
         PrepTaskRunResponse, Project, ProjectBranchesResponse, PublicSettings, TaskGroup,
         TaskGroupParamsRequest, TaskGroupRequest, TaskPrepAction, TaskPrepTarget, TaskStatus,
-        value_text,
+        parse_number_value, value_text,
     },
 };
 
@@ -249,8 +249,8 @@ fn GroupParamField(definition: ParamDefinition, draft: Signal<TaskGroup>) -> Ele
     let rendered = value_text(&value);
     rsx! { div { class: "field", label { class: "field__label", "{definition.label}" span { class: "tag tag--mono", "{definition.key}" } }
         if definition.kind == ParamKind::Switch { label { class: "switch", input { r#type: "checkbox", checked: value.as_bool().unwrap_or(false), onchange: move |event| { draft.write().params.insert(definition.key.clone(), Value::Bool(event.checked())); } } i {} } }
-        else if definition.kind == ParamKind::Select { select { class: "select", value: "{rendered}", onchange: move |event| { draft.write().params.insert(definition.key.clone(), Value::String(event.value())); }, for option in definition.options { option { value: "{option}", "{option}" } } } }
-        else { input { class: "input input--mono", value: "{rendered}", oninput: move |event| { let value = if definition.kind == ParamKind::Number { event.value().parse::<f64>().map(Value::from).unwrap_or(Value::String(event.value())) } else { Value::String(event.value()) }; draft.write().params.insert(definition.key.clone(), value); } } }
+        else if definition.kind == ParamKind::Select { select { class: "select", value: "{rendered}", onchange: move |event| { draft.write().params.insert(definition.key.clone(), Value::String(event.value())); }, for option in definition.options { option { key: "{option}", value: "{option}", selected: option == rendered, "{option}" } } } }
+        else { input { class: "input input--mono", value: "{rendered}", oninput: move |event| { let value = if definition.kind == ParamKind::Number { parse_number_value(&event.value()) } else { Value::String(event.value()) }; draft.write().params.insert(definition.key.clone(), value); } } }
         if !definition.description.is_empty() { p { class: "hint", "{definition.description}" } }
     } }
 }

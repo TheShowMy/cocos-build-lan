@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::{
     error::AppError,
     models::{ParamDefinition, ParamKind, TaskGroup, TaskGroupParamsRequest, TaskGroupRequest},
+    services::settings::normalize_integral_number,
     state::AppState,
 };
 
@@ -217,10 +218,13 @@ fn normalize_params(
 
     let mut normalized = BTreeMap::new();
     for definition in definitions {
-        let value = params
+        let mut value = params
             .get(&definition.key)
             .cloned()
             .unwrap_or_else(|| definition.default_value.clone());
+        if definition.kind == ParamKind::Number {
+            normalize_integral_number(&mut value);
+        }
         if definition.required && is_empty(&value) {
             return Err(AppError::validation(format!(
                 "参数 {} 不能为空",
@@ -300,6 +304,39 @@ mod tests {
                 BTreeMap::from([("channel".to_owned(), Value::String("bad".to_owned()))])
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn changing_number_preserves_existing_select_value() {
+        let definitions = vec![
+            ParamDefinition {
+                key: "minor_version".to_owned(),
+                kind: ParamKind::Number,
+                default_value: serde_json::json!(0),
+                required: true,
+                ..ParamDefinition::default()
+            },
+            ParamDefinition {
+                key: "build_mode".to_owned(),
+                kind: ParamKind::Select,
+                options: vec!["release".to_owned(), "test".to_owned()],
+                default_value: serde_json::json!("release"),
+                required: true,
+                ..ParamDefinition::default()
+            },
+        ];
+        let params = BTreeMap::from([
+            ("minor_version".to_owned(), serde_json::json!(7.0)),
+            ("build_mode".to_owned(), serde_json::json!("test")),
+        ]);
+
+        let normalized = normalize_params(&definitions, params).expect("params should be valid");
+
+        assert_eq!(normalized.get("minor_version"), Some(&serde_json::json!(7)));
+        assert_eq!(
+            normalized.get("build_mode"),
+            Some(&serde_json::json!("test"))
         );
     }
 

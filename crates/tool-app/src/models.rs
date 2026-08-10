@@ -581,6 +581,28 @@ pub fn value_text(value: &Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
+pub fn parse_number_value(raw: &str) -> Value {
+    if let Ok(value) = raw.parse::<i64>() {
+        Value::from(value)
+    } else if let Ok(value) = raw.parse::<u64>() {
+        Value::from(value)
+    } else if let Ok(Value::Number(value)) = serde_json::from_str(raw) {
+        let float = value.as_f64();
+        if let Some(float) = float.filter(|float| float.fract() == 0.0) {
+            let integer = float.to_string();
+            if let Ok(value) = integer.parse::<i64>() {
+                return Value::from(value);
+            }
+            if let Ok(value) = integer.parse::<u64>() {
+                return Value::from(value);
+            }
+        }
+        Value::Number(value)
+    } else {
+        Value::String(raw.to_owned())
+    }
+}
+
 fn default_version() -> String {
     "1.0.0".to_owned()
 }
@@ -632,5 +654,18 @@ mod tests {
         assert!(!project_path.is_user_runtime());
         assert!(runtime.is_user_runtime());
         assert!(!fixed.is_user_runtime());
+    }
+
+    #[test]
+    fn number_input_preserves_integer_and_invalid_value_types() {
+        assert_eq!(parse_number_value("7"), serde_json::json!(7));
+        assert_eq!(parse_number_value("-7"), serde_json::json!(-7));
+        assert_eq!(
+            parse_number_value("18446744073709551615"),
+            Value::from(u64::MAX)
+        );
+        assert_eq!(parse_number_value("7.0"), serde_json::json!(7));
+        assert_eq!(parse_number_value("7.5"), serde_json::json!(7.5));
+        assert_eq!(parse_number_value("7."), Value::String("7.".to_owned()));
     }
 }

@@ -64,6 +64,9 @@ fn normalize_update(update: &mut PublicSettingsUpdate) {
         if definition.kind != ParamKind::Select {
             definition.options.clear();
         }
+        if definition.kind == ParamKind::Number {
+            normalize_integral_number(&mut definition.default_value);
+        }
     }
 }
 
@@ -195,12 +198,15 @@ fn normalize_group_params(settings: &mut AppSettings) -> Result<(), AppError> {
     for group in &mut settings.task_groups {
         let mut params = std::collections::BTreeMap::new();
         for definition in &settings.param_definitions {
-            let value = group
+            let mut value = group
                 .params
                 .get(&definition.key)
                 .filter(|value| is_empty(value) || value_matches_kind(value, &definition.kind))
                 .cloned()
                 .unwrap_or_else(|| definition.default_value.clone());
+            if definition.kind == ParamKind::Number {
+                normalize_integral_number(&mut value);
+            }
             if definition.required && is_empty(&value) {
                 return Err(AppError::validation(format!(
                     "任务组 {} 的参数 {} 缺少有效值",
@@ -212,6 +218,32 @@ fn normalize_group_params(settings: &mut AppSettings) -> Result<(), AppError> {
         group.params = params;
     }
     Ok(())
+}
+
+pub(crate) fn normalize_integral_number(value: &mut Value) -> bool {
+    let Some(number) = value.as_number() else {
+        return false;
+    };
+    if !number.is_f64() {
+        return false;
+    }
+    let Some(float) = number.as_f64() else {
+        return false;
+    };
+    if !float.is_finite() || float.fract() != 0.0 {
+        return false;
+    }
+
+    let integer = float.to_string();
+    let normalized = integer
+        .parse::<i64>()
+        .map(Value::from)
+        .or_else(|_| integer.parse::<u64>().map(Value::from));
+    let Ok(normalized) = normalized else {
+        return false;
+    };
+    *value = normalized;
+    true
 }
 
 fn valid_parameter_key(value: &str) -> bool {
@@ -282,5 +314,16 @@ mod tests {
             ..ParamDefinition::default()
         };
         assert!(validate_definition(&definition).is_err());
+    }
+
+    #[test]
+    fn integral_floats_are_normalized_without_changing_decimals() {
+        let mut integer = serde_json::json!(7.0);
+        let mut decimal = serde_json::json!(7.5);
+
+        assert!(normalize_integral_number(&mut integer));
+        assert_eq!(integer, serde_json::json!(7));
+        assert!(!normalize_integral_number(&mut decimal));
+        assert_eq!(decimal, serde_json::json!(7.5));
     }
 }
