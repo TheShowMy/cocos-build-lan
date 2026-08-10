@@ -114,8 +114,8 @@ pub fn Prep() -> Element {
                 div { class: "drawer__body",
                     div { class: "field", label { class: "field__label", "目标项目" }
                         select { class: "select", value: "{run_project_id}", onchange: move |event| run_project_id.set(event.value()),
-                            option { value: "", "请选择项目" }
-                            for project in projects() { option { value: "{project.id}", "{project.name}" } }
+                            option { value: "", selected: run_project_id().is_empty(), "请选择项目" }
+                            for project in projects() { option { value: "{project.id}", selected: project.id == run_project_id(), "{project.name}" } }
                         }
                     }
                     p { class: "hint mono", "project_path 由目标项目自动注入" }
@@ -141,7 +141,7 @@ pub fn Prep() -> Element {
                 div { class: "drawer__head", "导入准备项目" span { class: "spacer" } button { class: "btn btn--ghost btn--icon", onclick: move |_| import_open.set(false), Icon { width: 17, height: 17, icon: LdX } } }
                 div { class: "drawer__body",
                     div { class: "segmented", button { class: if import_mode() == "create" { "is-active" } else { "" }, onclick: move |_| import_mode.set("create".to_owned()), "新建" } button { class: if import_mode() == "update" { "is-active" } else { "" }, onclick: move |_| import_mode.set("update".to_owned()), "覆盖更新" } }
-                    if import_mode() == "update" { div { class: "field", label { class: "field__label", "目标准备项目" } select { class: "select", value: "{import_target}", onchange: move |event| import_target.set(event.value()), option { value: "", "请选择" } for prep in preps() { option { value: "{prep.id}", "{prep.name}" } } } } }
+                    if import_mode() == "update" { div { class: "field", label { class: "field__label", "目标准备项目" } select { class: "select", value: "{import_target}", onchange: move |event| import_target.set(event.value()), option { value: "", selected: import_target().is_empty(), "请选择" } for prep in preps() { option { value: "{prep.id}", selected: prep.id == import_target(), "{prep.name}" } } } } }
                     div { class: "field", label { class: "field__label", "导出 JSON" } textarea { class: "textarea textarea--mono textarea--tall", placeholder: "粘贴准备项目导出的 JSON", value: "{import_raw}", oninput: move |event| import_raw.set(event.value()) } }
                 }
                 div { class: "drawer__foot", button { class: "btn", onclick: move |_| import_open.set(false), "取消" } button { class: "btn btn--primary", disabled: import_raw().trim().is_empty() || (import_mode() == "update" && import_target().is_empty()), onclick: move |_| { let request = PrepImportRequest { raw_text: import_raw(), mode: import_mode(), target_prep_project_id: (import_mode() == "update").then(&*import_target) }; spawn(async move { match api::post::<PrepProject, _>("/api/prep-projects/import", &request).await { Ok(_) => { import_open.set(false); import_raw.set(String::new()); context.success("准备项目已导入"); refresh += 1; }, Err(error) => context.error(error) } }); }, "导入" } }
@@ -243,9 +243,9 @@ fn PrepParamRow(index: usize, parameter: PrepParam, draft: Signal<PrepProject>) 
                 div { class: "field param-row__wide", label { class: "field__label", "固定值" }
                     if parameter.param_type == PrepParamType::Select {
                         select { class: "select", value: "{fixed_text}", onchange: move |event| draft.write().params[index].fixed_value = Some(Value::String(event.value())),
-                            option { value: "", disabled: true, "请选择固定值" }
+                            option { value: "", disabled: true, selected: fixed_text.is_empty(), "请选择固定值" }
                             for option in parameter.options.iter().filter(|option| !option.value.is_empty()) {
-                                option { value: "{option.value}", if option.label.is_empty() { "未命名选项" } else { "{option.label}" } }
+                                option { value: "{option.value}", selected: option.value == fixed_text, if option.label.is_empty() { "未命名选项" } else { "{option.label}" } }
                             }
                         }
                     } else {
@@ -272,7 +272,7 @@ fn RuntimeParamField(parameter: PrepParam, values: Signal<HashMap<String, Value>
             if parameter.param_type == PrepParamType::Bool {
                 label { class: "switch", input { r#type: "checkbox", checked: current.as_bool().unwrap_or(false), onchange: move |event| { values.write().insert(parameter.name.clone(), Value::Bool(event.checked())); } } i {} }
             } else if parameter.param_type == PrepParamType::Select {
-                select { class: "select", value: "{current_text}", onchange: move |event| { values.write().insert(parameter.name.clone(), Value::String(event.value())); }, for option in parameter.options { option { value: "{option.value}", "{option.label}" } } }
+                select { class: "select", value: "{current_text}", onchange: move |event| { values.write().insert(parameter.name.clone(), Value::String(event.value())); }, for option in parameter.options { option { value: "{option.value}", selected: option.value == current_text, "{option.label}" } } }
             } else {
                 input { class: "input input--mono", value: "{current_text}", oninput: move |event| { values.write().insert(parameter.name.clone(), parse_param_value(&parameter.param_type, &event.value())); } }
             }

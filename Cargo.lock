@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "cocos-build-lan-app"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dioxus",
  "dioxus-free-icons",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "cocos-build-lan-contract"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "cocos-build-lan-core",
  "serde",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "cocos-build-lan-control"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "cocos-build-lan-contract",
  "cocos-build-lan-core",
@@ -695,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "cocos-build-lan-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "axum",
  "directories",
@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "cocos-build-lan-launcher"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "cocos-build-lan-core",
  "serde_json",
@@ -724,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "cocos-build-lan-server"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "axum",
  "base64",
