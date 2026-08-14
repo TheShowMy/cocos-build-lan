@@ -1,4 +1,4 @@
-[workspace]
+﻿[workspace]
 members = [
     "crates/tool-core",
     "crates/tool-launcher",
@@ -11,7 +11,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.9"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.97.1"
@@ -39,7 +39,6 @@ uuid = { version = "1.18.1", features = ["serde", "v4"] }
 walkdir = "2.5.0"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 
-# release 剥离 DWARF 调试信息：wasm 里的 DWARFv5 会让 dx 内置 wasm-opt 崩溃（SIGABRT），
-# 对服务端/控制端的 release 二进制也是常规做法。
-[profile.release]
+# release 鍓ョ DWARF 璋冭瘯淇℃伅锛歸asm 閲岀殑 DWARFv5 浼氳 dx 鍐呯疆 wasm-opt 宕╂簝锛圫IGABRT锛夛紝
+# 瀵规湇鍔＄/鎺у埗绔殑 release 浜岃繘鍒朵篃鏄父瑙勫仛娉曘€?[profile.release]
 strip = "debuginfo"

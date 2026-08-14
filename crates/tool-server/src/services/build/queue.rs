@@ -1,10 +1,14 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
+use tokio::time::sleep;
 use tracing::{error, info};
 
 use crate::{
     error::AppError,
-    models::{BuildStartRequest, PackageTaskStatus},
+    models::{BuildStartRequest, PackageTaskRuntime, PackageTaskStatus},
     services::feishu::{
         self, BuildFinishedNotification, FailedTaskNotification, FinishedTaskSummary,
     },
@@ -30,6 +34,47 @@ struct QueueTaskSnapshot {
     branch: String,
 }
 
+/// 停止请求超过该时长仍未完成，由看门狗强制标记失败，防止界面永远停留在"停止中"。
+const CANCEL_STUCK_AFTER_SECS: u64 = 3 * 60;
+const CANCEL_WATCHDOG_TICK: Duration = Duration::from_secs(10);
+
+fn is_cancel_stuck(runtime: &PackageTaskRuntime, now_unix_secs: u64) -> bool {
+    runtime.status == PackageTaskStatus::Canceling
+        && runtime
+            .canceling_at_unix_secs
+            .is_some_and(|started| now_unix_secs.saturating_sub(started) >= CANCEL_STUCK_AFTER_SECS)
+}
+
+async fn watch_cancel_timeouts(state: AppState) {
+    loop {
+        sleep(CANCEL_WATCHDOG_TICK).await;
+        if !state.is_build_in_progress().await {
+            break;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        for runtime in state.all_task_runtimes().await {
+            if !is_cancel_stuck(&runtime, now) {
+                continue;
+            }
+            error!(task_id = %runtime.task_id, "停止请求超时，强制标记失败");
+            let _ = state
+                .update_task_runtime(&runtime.task_id, RuntimeFlushMode::Immediate, |runtime| {
+                    runtime.status = PackageTaskStatus::Failed;
+                    runtime.step_label = "停止超时，已强制结束".to_owned();
+                    runtime.last_error = Some(
+                        "停止请求超过 3 分钟未完成，已强制标记为失败（子进程可能无法终止）"
+                            .to_owned(),
+                    );
+                    runtime.finished_at = Some(super::logging::now_string());
+                })
+                .await;
+        }
+    }
+}
+
 pub async fn start_build(state: AppState, request: BuildStartRequest) -> Result<(), AppError> {
     state.try_start_build().await?;
     let tasks = match collect_requested_tasks(&state, &request).await {
@@ -51,6 +96,8 @@ pub async fn start_build(state: AppState, request: BuildStartRequest) -> Result<
     let task_ids = request.task_ids;
     tokio::spawn(async move {
         let _restart_guard = state.restart_guard("打包任务队列");
+        let watchdog_state = state.clone();
+        tokio::spawn(watch_cancel_timeouts(watchdog_state));
         if let Err(error) = run_build_queue(state.clone(), task_ids).await {
             error!(error = %error, "构建队列执行失败");
         }

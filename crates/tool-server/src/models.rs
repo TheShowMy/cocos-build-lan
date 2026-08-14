@@ -165,6 +165,15 @@ pub struct FeishuBotConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct GroupParamPreset {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub params: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskGroup {
     pub id: String,
     pub project_id: String,
@@ -174,6 +183,10 @@ pub struct TaskGroup {
     pub branch: String,
     #[serde(default)]
     pub params: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub presets: Vec<GroupParamPreset>,
+    #[serde(default)]
+    pub hidden_params: Vec<String>,
     #[serde(default)]
     pub order: u32,
 }
@@ -424,6 +437,8 @@ pub struct PackageTaskRuntime {
     pub started_at: Option<String>,
     #[serde(default)]
     pub finished_at: Option<String>,
+    #[serde(default)]
+    pub canceling_at_unix_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -486,6 +501,10 @@ pub struct TaskGroupRequest {
     pub params: BTreeMap<String, Value>,
     #[serde(default)]
     pub copy_from_group_id: Option<String>,
+    #[serde(default)]
+    pub presets: Option<Vec<GroupParamPreset>>,
+    #[serde(default)]
+    pub hidden_params: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

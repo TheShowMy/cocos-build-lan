@@ -72,6 +72,12 @@ async fn main() {
         .set_git_config(control_settings.business.git_config().into())
         .await
         .expect("同步控制端 Git 凭据");
+    app_state
+        .set_workspace_root(
+            (!control_settings.business.workspace_root.trim().is_empty())
+                .then(|| PathBuf::from(control_settings.business.workspace_root.trim())),
+        )
+        .await;
 
     let control = ControlState {
         settings: Arc::new(RwLock::new(control_settings)),
@@ -186,6 +192,13 @@ async fn save_control_config(
         .app
         .set_git_config(settings.business.git_config().into())
         .await?;
+    control
+        .app
+        .set_workspace_root(
+            (!settings.business.workspace_root.trim().is_empty())
+                .then(|| PathBuf::from(settings.business.workspace_root.trim())),
+        )
+        .await;
     *control.settings.write().await = settings.clone();
     Ok(Json(settings))
 }

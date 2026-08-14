@@ -336,6 +336,46 @@ textarea:focus-visible, summary:focus-visible {
 /* 开关与 28px 输入框基线对齐 */
 .group-detail__form .field .switch { margin: 5px 0; }
 .group-detail__save { align-self: end; }
+.group-detail__hidden-hint { grid-column: 1 / -1; }
+.group-detail__presets {
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.preset-head { display: flex; align-items: center; gap: 7px; }
+.preset-head .hint { font-size: 11.5px; }
+.preset-list { display: flex; flex-wrap: wrap; gap: 7px; }
+.preset-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 11px; border: 1px solid var(--border-strong);
+  border-radius: 999px; background: var(--surface-2);
+  font-size: 12.5px; font-weight: 500; cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.preset-chip:hover { border-color: var(--accent); color: var(--accent); }
+.preset-chip.is-applied { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.preset-chip__check {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none;
+}
+.preset-editor {
+  padding: 10px 12px; border: 1px solid var(--border);
+  border-radius: var(--radius); display: flex; flex-direction: column; gap: 9px;
+}
+.preset-editor__head { display: flex; align-items: center; gap: 8px; }
+.preset-editor__head .input { flex: 1; }
+.preset-param {
+  display: grid; grid-template-columns: 92px minmax(0, 1fr);
+  gap: 8px; align-items: start;
+}
+.preset-param__include { padding-top: 5px; white-space: nowrap; }
+.preset-param__control { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.visibility-list {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 9px 11px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--surface-2);
+}
+.visibility-row { display: flex; align-items: center; gap: 8px; min-height: 26px; }
+.visibility-row .tag { font-size: 10.5px; }
+.modal--config { width: min(620px, 94vw); }
 .task-table .table { min-width: 760px; }
 .task-error { max-width: 360px; margin: 3px 0 0; color: var(--err); font-size: 11px; overflow-wrap: anywhere; }
 

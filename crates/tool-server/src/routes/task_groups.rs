@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use axum::{
     Json, Router,
@@ -9,7 +9,10 @@ use serde_json::Value;
 
 use crate::{
     error::AppError,
-    models::{ParamDefinition, ParamKind, TaskGroup, TaskGroupParamsRequest, TaskGroupRequest},
+    models::{
+        GroupParamPreset, ParamDefinition, ParamKind, TaskGroup, TaskGroupParamsRequest,
+        TaskGroupRequest,
+    },
     services::settings::normalize_integral_number,
     state::AppState,
 };
@@ -70,6 +73,14 @@ async fn create_task_group(
         description: request.description.trim().to_owned(),
         branch: request.branch.trim().to_owned(),
         params: normalize_params(&settings.param_definitions, params)?,
+        presets: normalize_presets(
+            &settings.param_definitions,
+            request.presets.unwrap_or_default(),
+        )?,
+        hidden_params: normalize_hidden_params(
+            &settings.param_definitions,
+            request.hidden_params.unwrap_or_default(),
+        )?,
         order,
     };
     settings.task_groups.push(group.clone());
@@ -95,6 +106,12 @@ async fn update_task_group(
     group.description = request.description.trim().to_owned();
     group.branch = request.branch.trim().to_owned();
     group.params = normalize_params(&definitions, request.params)?;
+    if let Some(presets) = request.presets {
+        group.presets = normalize_presets(&definitions, presets)?;
+    }
+    if let Some(hidden) = request.hidden_params {
+        group.hidden_params = normalize_hidden_params(&definitions, hidden)?;
+    }
     let result = group.clone();
     for task in settings
         .package_tasks
@@ -222,42 +239,106 @@ fn normalize_params(
             .get(&definition.key)
             .cloned()
             .unwrap_or_else(|| definition.default_value.clone());
-        if definition.kind == ParamKind::Number {
-            normalize_integral_number(&mut value);
-        }
         if definition.required && is_empty(&value) {
             return Err(AppError::validation(format!(
                 "参数 {} 不能为空",
                 definition.label
             )));
         }
-        if definition.kind == ParamKind::Select {
-            let Some(value) = value.as_str() else {
-                return Err(AppError::validation(format!(
-                    "参数 {} 必须是选项值",
-                    definition.label
-                )));
-            };
-            if !definition.options.iter().any(|option| option == value) {
-                return Err(AppError::validation(format!(
-                    "参数 {} 的选项无效",
-                    definition.label
-                )));
-            }
-        }
-        if definition.kind == ParamKind::Switch && !value.is_boolean() {
-            return Err(AppError::validation(format!(
-                "参数 {} 必须是开关值",
-                definition.label
-            )));
-        }
-        if definition.kind == ParamKind::Number && !value.is_number() {
+        check_param_kind(definition, &mut value)?;
+        normalized.insert(definition.key.clone(), value);
+    }
+    Ok(normalized)
+}
+
+fn check_param_kind(definition: &ParamDefinition, value: &mut Value) -> Result<(), AppError> {
+    if definition.kind == ParamKind::Number {
+        normalize_integral_number(value);
+        if !value.is_number() {
             return Err(AppError::validation(format!(
                 "参数 {} 必须是数字",
                 definition.label
             )));
         }
-        normalized.insert(definition.key.clone(), value);
+    }
+    if definition.kind == ParamKind::Select {
+        let Some(value) = value.as_str() else {
+            return Err(AppError::validation(format!(
+                "参数 {} 必须是选项值",
+                definition.label
+            )));
+        };
+        if !definition.options.iter().any(|option| option == value) {
+            return Err(AppError::validation(format!(
+                "参数 {} 的选项无效",
+                definition.label
+            )));
+        }
+    }
+    if definition.kind == ParamKind::Switch && !value.is_boolean() {
+        return Err(AppError::validation(format!(
+            "参数 {} 必须是开关值",
+            definition.label
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_presets(
+    definitions: &[ParamDefinition],
+    presets: Vec<GroupParamPreset>,
+) -> Result<Vec<GroupParamPreset>, AppError> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::with_capacity(presets.len());
+    for preset in presets {
+        let name = preset.name.trim().to_owned();
+        if name.is_empty() {
+            return Err(AppError::validation("预设名称不能为空"));
+        }
+        if !seen.insert(name.to_ascii_lowercase()) {
+            return Err(AppError::conflict(format!("预设名称不能重复：{name}")));
+        }
+        let mut params = BTreeMap::new();
+        for (key, mut value) in preset.params {
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.key == key)
+                .ok_or_else(|| {
+                    AppError::validation(format!("预设 {name} 引用了未知任务参数 {key}"))
+                })?;
+            check_param_kind(definition, &mut value)?;
+            params.insert(key, value);
+        }
+        let id = preset.id.trim();
+        let id = if id.is_empty() {
+            format!("preset_{}", uuid::Uuid::new_v4().simple())
+        } else {
+            id.to_owned()
+        };
+        normalized.push(GroupParamPreset { id, name, params });
+    }
+    Ok(normalized)
+}
+
+fn normalize_hidden_params(
+    definitions: &[ParamDefinition],
+    hidden: Vec<String>,
+) -> Result<Vec<String>, AppError> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    for key in hidden {
+        let key = key.trim().to_owned();
+        if key.is_empty() {
+            continue;
+        }
+        if !definitions.iter().any(|definition| definition.key == key) {
+            return Err(AppError::validation(format!(
+                "隐藏参数引用了未知任务参数 {key}"
+            )));
+        }
+        if seen.insert(key.clone()) {
+            normalized.push(key);
+        }
     }
     Ok(normalized)
 }
@@ -278,7 +359,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::models::{AppSettings, PackageTask, Project};
+    use crate::models::{AppSettings, GroupParamPreset, PackageTask, Project};
 
     #[test]
     fn parameter_validation_rejects_unknown_and_invalid_select_values() {
@@ -338,6 +419,227 @@ mod tests {
             normalized.get("build_mode"),
             Some(&serde_json::json!("test"))
         );
+    }
+
+    #[test]
+    fn presets_validate_names_params_and_assign_ids() {
+        let definitions = vec![
+            ParamDefinition {
+                key: "hot_update".to_owned(),
+                kind: ParamKind::Switch,
+                default_value: Value::Bool(false),
+                ..ParamDefinition::default()
+            },
+            ParamDefinition {
+                key: "env".to_owned(),
+                kind: ParamKind::Select,
+                options: vec!["dev".to_owned(), "pre".to_owned(), "release".to_owned()],
+                default_value: Value::String("dev".to_owned()),
+                ..ParamDefinition::default()
+            },
+            ParamDefinition {
+                key: "count".to_owned(),
+                kind: ParamKind::Number,
+                default_value: serde_json::json!(0),
+                ..ParamDefinition::default()
+            },
+        ];
+
+        let presets = normalize_presets(
+            &definitions,
+            vec![GroupParamPreset {
+                id: String::new(),
+                name: "首提审包".to_owned(),
+                params: BTreeMap::from([
+                    ("hot_update".to_owned(), Value::Bool(false)),
+                    ("env".to_owned(), Value::String("dev".to_owned())),
+                    ("count".to_owned(), serde_json::json!(7.0)),
+                ]),
+            }],
+        )
+        .expect("partial preset should be valid");
+
+        assert_eq!(presets.len(), 1);
+        assert!(!presets[0].id.is_empty());
+        assert_eq!(presets[0].name, "首提审包");
+        assert_eq!(presets[0].params["count"], serde_json::json!(7));
+        assert_eq!(presets[0].params["hot_update"], Value::Bool(false));
+        assert_eq!(presets[0].params["env"], Value::String("dev".to_owned()));
+    }
+
+    #[test]
+    fn presets_reject_unknown_params_duplicate_names_and_bad_kinds() {
+        let definitions = vec![ParamDefinition {
+            key: "env".to_owned(),
+            kind: ParamKind::Select,
+            options: vec!["dev".to_owned()],
+            default_value: Value::String("dev".to_owned()),
+            ..ParamDefinition::default()
+        }];
+        let unknown = normalize_presets(
+            &definitions,
+            vec![GroupParamPreset {
+                name: "预设".to_owned(),
+                params: BTreeMap::from([("nope".to_owned(), serde_json::json!(1))]),
+                ..GroupParamPreset::default()
+            }],
+        );
+        assert!(unknown.is_err());
+        let bad_value = normalize_presets(
+            &definitions,
+            vec![GroupParamPreset {
+                name: "预设".to_owned(),
+                params: BTreeMap::from([("env".to_owned(), serde_json::json!("bad"))]),
+                ..GroupParamPreset::default()
+            }],
+        );
+        assert!(bad_value.is_err());
+        let duplicated = normalize_presets(
+            &definitions,
+            vec![
+                GroupParamPreset {
+                    name: "线上".to_owned(),
+                    ..GroupParamPreset::default()
+                },
+                GroupParamPreset {
+                    name: "线上".to_owned(),
+                    ..GroupParamPreset::default()
+                },
+            ],
+        );
+        assert!(duplicated.is_err());
+        let empty_name = normalize_presets(
+            &definitions,
+            vec![GroupParamPreset {
+                name: "  ".to_owned(),
+                ..GroupParamPreset::default()
+            }],
+        );
+        assert!(empty_name.is_err());
+    }
+
+    #[test]
+    fn hidden_params_reject_unknown_keys_and_deduplicate() {
+        let definitions = vec![ParamDefinition {
+            key: "env".to_owned(),
+            ..ParamDefinition::default()
+        }];
+        let unknown =
+            normalize_hidden_params(&definitions, vec!["env".to_owned(), "nope".to_owned()]);
+        assert!(unknown.is_err());
+
+        let hidden = normalize_hidden_params(
+            &definitions,
+            vec![
+                "env".to_owned(),
+                " env ".to_owned(),
+                "env".to_owned(),
+                "".to_owned(),
+            ],
+        )
+        .expect("valid hidden params");
+        assert_eq!(hidden, vec!["env".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn updating_group_keeps_omitted_presets_and_replaces_sent_ones() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "cocos_build_group_presets_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let state = AppState::load(data_dir.clone()).await;
+        state
+            .save_settings(AppSettings {
+                projects: vec![Project {
+                    id: "project_1".to_owned(),
+                    workspace_dir_key: "workspace_1".to_owned(),
+                    name: "项目".to_owned(),
+                    ..Project::default()
+                }],
+                param_definitions: vec![ParamDefinition {
+                    key: "env".to_owned(),
+                    kind: ParamKind::Select,
+                    options: vec!["dev".to_owned(), "pre".to_owned(), "release".to_owned()],
+                    default_value: Value::String("dev".to_owned()),
+                    ..ParamDefinition::default()
+                }],
+                task_groups: vec![TaskGroup {
+                    id: "group_1".to_owned(),
+                    project_id: "project_1".to_owned(),
+                    name: "主分组".to_owned(),
+                    branch: "main".to_owned(),
+                    presets: vec![GroupParamPreset {
+                        id: "preset_old".to_owned(),
+                        name: "旧预设".to_owned(),
+                        params: BTreeMap::new(),
+                    }],
+                    hidden_params: vec!["env".to_owned()],
+                    ..TaskGroup::default()
+                }],
+                ..AppSettings::default()
+            })
+            .await
+            .expect("settings");
+        let app: Router = router().with_state(state.clone());
+
+        let update_without_config = Request::builder()
+            .method("PUT")
+            .uri("/api/task-groups/group_1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "projectId": "project_1",
+                    "name": "主分组",
+                    "description": "",
+                    "branch": "release",
+                    "params": {}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(update_without_config).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let group = state.get_settings().await.task_groups[0].clone();
+        assert_eq!(group.presets[0].id, "preset_old");
+        assert_eq!(group.hidden_params, vec!["env".to_owned()]);
+        assert_eq!(group.branch, "release");
+
+        let update_with_config = Request::builder()
+            .method("PUT")
+            .uri("/api/task-groups/group_1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "projectId": "project_1",
+                    "name": "主分组",
+                    "description": "",
+                    "branch": "release",
+                    "params": {},
+                    "presets": [{
+                        "id": "",
+                        "name": "线上热更新",
+                        "params": { "env": "release" }
+                    }],
+                    "hiddenParams": ["env"]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(update_with_config).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let group = state.get_settings().await.task_groups[0].clone();
+        assert_eq!(group.presets.len(), 1);
+        assert_eq!(group.presets[0].name, "线上热更新");
+        assert!(!group.presets[0].id.is_empty());
+        assert_eq!(
+            group.presets[0].params["env"],
+            Value::String("release".to_owned())
+        );
+
+        let _ = tokio::fs::remove_dir_all(data_dir).await;
     }
 
     #[tokio::test]
@@ -430,6 +732,8 @@ mod tests {
                         "channel".to_owned(),
                         Value::String("copied".to_owned()),
                     )]),
+                    presets: Vec::new(),
+                    hidden_params: Vec::new(),
                     order: 0,
                 }],
                 ..AppSettings::default()

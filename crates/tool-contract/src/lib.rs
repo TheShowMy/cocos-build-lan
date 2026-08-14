@@ -52,6 +52,10 @@ pub struct BusinessSettings {
     pub git_username: String,
     #[serde(default)]
     pub git_password: String,
+    /// 构建工作区根目录；留空使用默认数据目录。请使用短路径（如 E:\lan-workspaces），
+    /// 避免 Cocos Creator 因路径过长在自动图集步骤崩溃。
+    #[serde(default)]
+    pub workspace_root: String,
 }
 
 impl BusinessSettings {

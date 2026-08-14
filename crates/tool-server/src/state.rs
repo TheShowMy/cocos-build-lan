@@ -45,6 +45,7 @@ pub struct AppState {
     runtime_path: PathBuf,
     settings: Arc<RwLock<AppSettings>>,
     git_config: Arc<RwLock<GitConfig>>,
+    workspace_root: Arc<std::sync::RwLock<Option<PathBuf>>>,
     runtime_state: Arc<RwLock<RuntimeState>>,
     runtime_revision: Arc<AtomicU64>,
     persisted_runtime_revision: Arc<AtomicU64>,
@@ -116,6 +117,7 @@ impl AppState {
             runtime_path,
             settings: Arc::new(RwLock::new(settings)),
             git_config: Arc::new(RwLock::new(imported_git_config)),
+            workspace_root: Arc::new(std::sync::RwLock::new(None)),
             runtime_state: Arc::new(RwLock::new(runtime_state)),
             runtime_revision: Arc::new(AtomicU64::new(0)),
             persisted_runtime_revision: Arc::new(AtomicU64::new(0)),
@@ -147,8 +149,27 @@ impl AppState {
         self.data_dir.join("preps")
     }
 
+    /// 设置工作区根目录；留空使用默认数据目录下的 workspaces。
+    /// 短路径可避免 Cocos Creator 因路径过长在自动图集步骤崩溃。
+    pub async fn set_workspace_root(&self, root: Option<PathBuf>) {
+        let root = root.filter(|root| !root.as_os_str().is_empty());
+        if let Ok(mut guard) = self.workspace_root.write() {
+            *guard = root.clone();
+        }
+        if let Some(root) = root {
+            info!(workspace_root = %root.display(), "工作区目录已设置为自定义路径");
+        }
+    }
+
     pub fn workspaces_dir(&self) -> PathBuf {
-        self.data_dir.join("workspaces")
+        match self.workspace_root.read() {
+            Ok(guard) => guard
+                .as_ref()
+                .filter(|root| !root.as_os_str().is_empty())
+                .cloned()
+                .unwrap_or_else(|| self.data_dir.join("workspaces")),
+            Err(_) => self.data_dir.join("workspaces"),
+        }
     }
 
     pub fn workspace_main_repo_dir(&self, project: &Project) -> PathBuf {
@@ -291,6 +312,8 @@ impl AppState {
                 description: String::new(),
                 branch: legacy.branch,
                 params: BTreeMap::new(),
+                presets: Vec::new(),
+                hidden_params: Vec::new(),
                 order: 0,
             },
         ))
@@ -428,6 +451,12 @@ impl AppState {
         self.update_task_runtime(task_id, RuntimeFlushMode::Immediate, |runtime| {
             runtime.status = PackageTaskStatus::Canceling;
             runtime.step_label = "正在终止子进程…".to_owned();
+            runtime.canceling_at_unix_secs = Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
         })
         .await?;
         Ok(())
@@ -450,6 +479,14 @@ impl AppState {
         *flag = false;
         *self.cancel_sender.lock().await = None;
         *self.active_task_id.write().await = None;
+    }
+
+    pub async fn is_build_in_progress(&self) -> bool {
+        *self.build_in_progress.lock().await
+    }
+
+    pub async fn all_task_runtimes(&self) -> Vec<PackageTaskRuntime> {
+        self.runtime_state.read().await.package_tasks.clone()
     }
 
     pub async fn flush_runtime_state(&self) -> Result<(), AppError> {
@@ -768,6 +805,11 @@ fn normalize_settings(mut settings: AppSettings) -> (AppSettings, bool) {
             })
         })
         .collect::<HashSet<_>>();
+    let definition_keys = settings
+        .param_definitions
+        .iter()
+        .map(|definition| definition.key.clone())
+        .collect::<HashSet<_>>();
     for group in &mut settings.task_groups {
         for key in &numeric_keys {
             if let Some(value) = group.params.get_mut(key)
@@ -775,6 +817,21 @@ fn normalize_settings(mut settings: AppSettings) -> (AppSettings, bool) {
             {
                 changed = true;
             }
+            for preset in &mut group.presets {
+                if let Some(value) = preset.params.get_mut(key)
+                    && normalize_integral_number(value)
+                {
+                    changed = true;
+                }
+            }
+        }
+        let hidden_before = group.hidden_params.len();
+        let mut hidden_seen = HashSet::new();
+        group
+            .hidden_params
+            .retain(|key| definition_keys.contains(key) && hidden_seen.insert(key.clone()));
+        if group.hidden_params.len() != hidden_before {
+            changed = true;
         }
     }
 
@@ -845,6 +902,8 @@ fn normalize_settings(mut settings: AppSettings) -> (AppSettings, bool) {
                 description: String::new(),
                 branch,
                 params,
+                presets: Vec::new(),
+                hidden_params: Vec::new(),
                 order: next_order,
             });
             next_order = next_order.saturating_add(1);
@@ -1088,6 +1147,7 @@ fn task_runtime_from_task(task: &PackageTask) -> PackageTaskRuntime {
         last_error: task.last_error.clone(),
         started_at: task.started_at.clone(),
         finished_at: task.finished_at.clone(),
+        canceling_at_unix_secs: None,
     }
 }
 
@@ -1135,7 +1195,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::models::{ObfuscationMode, Project, TaskPrepAction, TaskProjectConfig};
+    use crate::models::{
+        GroupParamPreset, ObfuscationMode, Project, TaskPrepAction, TaskProjectConfig,
+    };
 
     fn sample_task() -> PackageTask {
         PackageTask {
@@ -1187,6 +1249,28 @@ mod tests {
         assert_eq!(stripped.last_error, None);
     }
 
+    #[tokio::test]
+    async fn workspace_root_override_should_shorten_workspaces_dir() {
+        let state = AppState::load(std::env::temp_dir().join(format!(
+            "cocos_build_workspace_root_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        )))
+        .await;
+        let default_dir = state.workspaces_dir();
+        assert!(default_dir.ends_with("workspaces"));
+
+        state
+            .set_workspace_root(Some(PathBuf::from("E:\\lan-workspaces")))
+            .await;
+        assert_eq!(state.workspaces_dir(), PathBuf::from("E:\\lan-workspaces"));
+
+        state.set_workspace_root(Some(PathBuf::new())).await;
+        assert_eq!(state.workspaces_dir(), default_dir);
+    }
+
     #[test]
     fn apply_runtime_should_override_task_runtime_fields() {
         let settings = AppSettings {
@@ -1203,6 +1287,7 @@ mod tests {
                 last_error: Some("runtime".to_string()),
                 started_at: Some("s".to_string()),
                 finished_at: Some("f".to_string()),
+                canceling_at_unix_secs: None,
             }],
         };
 
@@ -1303,6 +1388,40 @@ mod tests {
         assert_eq!(
             normalized.task_groups[0].params.get("minor_version"),
             Some(&json!(7))
+        );
+    }
+
+    #[test]
+    fn normalize_settings_should_prune_stale_hidden_params_and_normalize_preset_numbers() {
+        let settings = AppSettings {
+            param_definitions: vec![ParamDefinition {
+                key: "count".to_owned(),
+                kind: ParamKind::Number,
+                default_value: json!(0),
+                ..ParamDefinition::default()
+            }],
+            task_groups: vec![TaskGroup {
+                hidden_params: vec!["count".to_owned(), "stale".to_owned(), "count".to_owned()],
+                presets: vec![GroupParamPreset {
+                    id: "preset_1".to_owned(),
+                    name: "线上".to_owned(),
+                    params: BTreeMap::from([("count".to_owned(), json!(7.0))]),
+                }],
+                ..TaskGroup::default()
+            }],
+            ..AppSettings::default()
+        };
+
+        let (normalized, changed) = normalize_settings(settings);
+
+        assert!(changed);
+        assert_eq!(
+            normalized.task_groups[0].hidden_params,
+            vec!["count".to_owned()]
+        );
+        assert_eq!(
+            normalized.task_groups[0].presets[0].params["count"],
+            json!(7)
         );
     }
 

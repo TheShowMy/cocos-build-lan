@@ -93,6 +93,15 @@ pub struct FeishuBot {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct GroupParamPreset {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub params: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskGroup {
     pub id: String,
     pub project_id: String,
@@ -102,6 +111,10 @@ pub struct TaskGroup {
     pub branch: String,
     #[serde(default)]
     pub params: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub presets: Vec<GroupParamPreset>,
+    #[serde(default)]
+    pub hidden_params: Vec<String>,
     #[serde(default)]
     pub order: u32,
 }
@@ -116,6 +129,10 @@ pub struct TaskGroupRequest {
     pub params: BTreeMap<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub copy_from_group_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presets: Option<Vec<GroupParamPreset>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden_params: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

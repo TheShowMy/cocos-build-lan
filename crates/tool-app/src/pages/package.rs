@@ -5,7 +5,7 @@ use dioxus_free_icons::{
     Icon,
     icons::ld_icons::{
         LdChevronDown, LdChevronUp, LdCircleStop, LdCopy, LdGitBranch, LdHammer, LdPencil, LdPlay,
-        LdPlus, LdRefreshCw, LdSave, LdSparkles, LdTrash2, LdX,
+        LdPlus, LdRefreshCw, LdSave, LdSettings, LdSparkles, LdTrash2, LdX,
     },
 };
 use gloo_timers::future::TimeoutFuture;
@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use crate::{
     AppContext, ConfirmDialog, api,
     models::{
-        BuildStatusResponse, ObfuscationMode, PackageTask, PackageTaskRequest, ParamDefinition,
-        ParamKind, PrepParam, PrepParamType, PrepProject, PrepRunForTasksRequest,
+        BuildStatusResponse, GroupParamPreset, ObfuscationMode, PackageTask, PackageTaskRequest,
+        ParamDefinition, ParamKind, PrepParam, PrepParamType, PrepProject, PrepRunForTasksRequest,
         PrepTaskRunResponse, Project, ProjectBranchesResponse, PublicSettings, TaskGroup,
         TaskGroupParamsRequest, TaskGroupRequest, TaskPrepAction, TaskPrepTarget, TaskStatus,
         parse_number_value, value_text,
@@ -200,6 +200,7 @@ fn GroupDetail(
     let mut saving = use_signal(|| false);
     let mut branches = use_signal(Vec::<String>::new);
     let mut branch_loading = use_signal(|| false);
+    let mut config_open = use_signal(|| false);
     let branch_project_id = group.project_id.clone();
     let project_name = project
         .as_ref()
@@ -220,23 +221,156 @@ fn GroupDetail(
             branch_loading.set(false);
         });
     };
+    let visible_definitions = definitions
+        .iter()
+        .filter(|definition| !group.hidden_params.iter().any(|key| key == &definition.key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let hidden_count = group.hidden_params.len();
+    let edit_group = group.clone();
+    let delete_group = group.clone();
+    let dialog_group = group.clone();
     rsx! {
         section { class: "group-detail",
             div { class: "group-detail__head",
                 div { h2 { "{group.name}" } p { class: "hint", "{project_name}" if !group.description.is_empty() { " · {group.description}" } } }
                 span { class: "spacer" }
-                button { class: "btn btn--sm", onclick: { let group = group.clone(); move |_| on_edit.call(group.clone()) }, Icon { width: 14, height: 14, icon: LdPencil } "编辑组" }
-                button { class: "btn btn--sm btn--danger btn--icon", title: "删除任务组", onclick: move |_| on_delete.call(group.clone()), Icon { width: 14, height: 14, icon: LdTrash2 } }
+                button { class: "btn btn--sm", onclick: move |_| on_edit.call(edit_group.clone()), Icon { width: 14, height: 14, icon: LdPencil } "编辑组" }
+                button { class: "btn btn--sm btn--danger btn--icon", title: "删除任务组", onclick: move |_| on_delete.call(delete_group.clone()), Icon { width: 14, height: 14, icon: LdTrash2 } }
             }
             div { class: "group-detail__form",
                 div { class: "field field--span-all", label { class: "field__label", "Git 分支" }
                     div { class: "input-action", if branches().is_empty() { input { class: "input input--mono", value: "{draft().branch}", oninput: move |event| draft.write().branch = event.value() } } else { select { class: "select select--mono", value: "{draft().branch}", onchange: move |event| draft.write().branch = event.value(), for branch in branches() { option { value: "{branch}", "{branch}" } } } } button { class: "btn btn--icon", title: "拉取远程分支", disabled: branch_loading(), onclick: load_branches, Icon { width: 15, height: 15, icon: LdGitBranch } } }
                 }
-                for definition in definitions { GroupParamField { definition, draft } }
+                for definition in visible_definitions { GroupParamField { definition, draft } }
+                if hidden_count > 0 { p { class: "hint group-detail__hidden-hint", "已隐藏 {hidden_count} 个参数，值保留并参与构建；可在参数配置中调整。" } }
                 div { class: "group-detail__save", button { class: "btn btn--primary", disabled: saving() || draft().branch.trim().is_empty(), onclick: move |event| { let id = draft().id; let request = TaskGroupParamsRequest { branch: draft().branch, params: draft().params }; spawn(async move { saving.set(true); match api::put::<TaskGroup, _>(&format!("/api/task-groups/{id}/params"), &request).await { Ok(_) => { context.success("任务组参数已保存"); on_saved.call(event); }, Err(error) => context.error(error) } saving.set(false); }); }, Icon { width: 15, height: 15, icon: LdSave } if saving() { "保存中…" } else { "保存组参数" } } }
+            }
+            div { class: "group-detail__presets",
+                div { class: "preset-head",
+                    strong { "参数预设" }
+                    span { class: "hint", "点击即切换并保存组参数" }
+                    span { class: "spacer" }
+                    button { class: "btn btn--sm", onclick: move |_| config_open.set(true), Icon { width: 14, height: 14, icon: LdSettings } "参数配置" }
+                }
+                if group.presets.is_empty() { p { class: "hint", "暂无预设；打开参数配置添加一键切换。" } }
+                div { class: "preset-list",
+                    for preset in group.presets.iter().cloned() {
+                        { let is_applied = !preset.params.is_empty() && preset.params.iter().all(|(key, value)| draft().params.get(key) == Some(value)); rsx! {
+                            button { class: if is_applied { "preset-chip is-applied" } else { "preset-chip" }, title: "点击切换为「{preset.name}」", onclick: { let preset = preset.clone(); move |event| {
+                                let id = draft().id;
+                                let branch = draft().branch;
+                                let mut params = draft().params.clone();
+                                for (key, value) in &preset.params { params.insert(key.clone(), value.clone()); }
+                                draft.write().params = params.clone();
+                                let request = TaskGroupParamsRequest { branch, params };
+                                let name = preset.name.clone();
+                                spawn(async move { match api::put::<TaskGroup, _>(&format!("/api/task-groups/{id}/params"), &request).await { Ok(_) => { context.success(format!("已切换为「{name}」")); on_saved.call(event); }, Err(error) => context.error(error) } });
+                            } }, if is_applied { span { class: "preset-chip__check" } } "{preset.name}" }
+                        } }
+                    }
+                }
+            }
+        }
+        if config_open() {
+            GroupConfigDialog { group: dialog_group, draft, definitions, on_close: move |_| config_open.set(false), on_saved: move |event| { config_open.set(false); on_saved.call(event); } }
+        }
+    }
+}
+
+#[component]
+fn GroupConfigDialog(
+    group: TaskGroup,
+    draft: Signal<TaskGroup>,
+    definitions: Vec<ParamDefinition>,
+    on_close: EventHandler<MouseEvent>,
+    on_saved: EventHandler<MouseEvent>,
+) -> Element {
+    let context = use_context::<AppContext>();
+    let mut presets = use_signal(|| group.presets.clone());
+    let mut hidden = use_signal(|| group.hidden_params.clone());
+    let mut saving = use_signal(|| false);
+    rsx! {
+        div { class: "overlay is-open", onclick: move |event| on_close.call(event) }
+        section { class: "modal modal--config is-open", role: "dialog", "aria-label": "参数配置",
+            div { class: "drawer__head", "参数配置" span { class: "tag tag--mono", "{group.name}" } span { class: "spacer" } button { class: "btn btn--ghost btn--icon", onclick: move |event| on_close.call(event), Icon { width: 17, height: 17, icon: LdX } } }
+            div { class: "drawer__body",
+                div { class: "section-heading", strong { "显示参数" } span { class: "hint", "隐藏的参数保留值并继续参与构建" } }
+                div { class: "visibility-list",
+                    for definition in &definitions {
+                        { let is_hidden = hidden().iter().any(|key| key == &definition.key); let key = definition.key.clone(); rsx! {
+                            label { class: "checkbox visibility-row", input { r#type: "checkbox", checked: !is_hidden, onchange: move |event| { if event.checked() { hidden.write().retain(|hidden| hidden != &key); } else if !hidden().iter().any(|hidden| hidden == &key) { hidden.write().push(key.clone()); } } } span { "{definition.label}" } span { class: "tag tag--mono", "{definition.key}" } span { class: "tag", "{definition.kind.label()}" } }
+                        } }
+                    }
+                    if definitions.is_empty() { p { class: "hint", "还没有参数定义，请先在设置页添加。" } }
+                }
+                div { class: "section-heading", strong { "参数预设" } span { class: "hint", "点击预设即一键切换组参数" } span { class: "spacer" } button { class: "btn btn--sm", onclick: move |_| { let params = draft().params.clone(); let name = format!("预设 {}", presets().len() + 1); presets.write().push(GroupParamPreset { id: String::new(), name, params }); }, Icon { width: 14, height: 14, icon: LdPlus } "添加预设" } }
+                if presets().is_empty() { p { class: "hint", "暂无预设" } }
+                for (index, preset) in presets().iter().cloned().enumerate() {
+                    div { class: "preset-editor", key: "{preset.id}-{index}",
+                        div { class: "preset-editor__head",
+                            input { class: "input input--mono", value: "{preset.name}", placeholder: "预设名称", oninput: move |event| presets.write()[index].name = event.value() }
+                            span { class: "tag tag--mono", "参与 {preset.params.len()} 个参数" }
+                            span { class: "spacer" }
+                            button { class: "btn btn--sm btn--danger btn--icon", title: "删除预设", onclick: move |_| { presets.write().remove(index); }, Icon { width: 14, height: 14, icon: LdTrash2 } }
+                        }
+                        for definition in &definitions {
+                            PresetParamField { definition: definition.clone(), presets, index }
+                        }
+                    }
+                }
+            }
+            div { class: "drawer__foot",
+                button { class: "btn", onclick: move |event| on_close.call(event), "取消" }
+                button { class: "btn btn--primary", disabled: saving(), onclick: move |event| {
+                    let id = draft().id;
+                    let request = TaskGroupRequest {
+                        project_id: draft().project_id,
+                        name: draft().name,
+                        description: draft().description,
+                        branch: draft().branch,
+                        params: draft().params,
+                        copy_from_group_id: None,
+                        presets: Some(presets()),
+                        hidden_params: Some(hidden()),
+                    };
+                    spawn(async move {
+                        saving.set(true);
+                        match api::put::<TaskGroup, _>(&format!("/api/task-groups/{id}"), &request).await {
+                            Ok(_) => { context.success("参数配置已保存"); on_saved.call(event); },
+                            Err(error) => context.error(error),
+                        }
+                        saving.set(false);
+                    });
+                }, if saving() { "保存中…" } else { "保存配置" } }
             }
         }
     }
+}
+
+#[component]
+fn PresetParamField(
+    definition: ParamDefinition,
+    presets: Signal<Vec<GroupParamPreset>>,
+    index: usize,
+) -> Element {
+    let included = presets()[index].params.contains_key(&definition.key);
+    let value = presets()[index]
+        .params
+        .get(&definition.key)
+        .cloned()
+        .unwrap_or(definition.default_value.clone());
+    let rendered = value_text(&value);
+    rsx! { div { class: "preset-param",
+        label { class: "checkbox preset-param__include", input { r#type: "checkbox", checked: included, onchange: { let definition = definition.clone(); move |event| { if event.checked() { presets.write()[index].params.insert(definition.key.clone(), definition.default_value.clone()); } else { presets.write()[index].params.remove(&definition.key); } } } } "参与" }
+        div { class: "preset-param__control",
+            label { class: "field__label", "{definition.label}" span { class: "tag tag--mono", "{definition.key}" } }
+            if !included { p { class: "hint", "未参与此预设，切换时保持当前值" } }
+            else if definition.kind == ParamKind::Switch { label { class: "switch", input { r#type: "checkbox", checked: value.as_bool().unwrap_or(false), onchange: { let definition = definition.clone(); move |event| { presets.write()[index].params.insert(definition.key.clone(), Value::Bool(event.checked())); } } } i {} } }
+            else if definition.kind == ParamKind::Select { select { class: "select", value: "{rendered}", onchange: { let definition = definition.clone(); move |event| { presets.write()[index].params.insert(definition.key.clone(), Value::String(event.value())); } }, for option in definition.options.iter() { option { key: "{option}", value: "{option}", selected: option == &rendered, "{option}" } } } }
+            else { input { class: "input input--mono", value: "{rendered}", oninput: { let definition = definition.clone(); move |event| { let value = if definition.kind == ParamKind::Number { parse_number_value(&event.value()) } else { Value::String(event.value()) }; presets.write()[index].params.insert(definition.key.clone(), value); } } } }
+        }
+    } }
 }
 
 #[component]
@@ -360,7 +494,7 @@ fn GroupEditor(
                 div { class: "field", label { class: "field__label", "Git 分支" } div { class: "input-action", if branches().is_empty() { input { class: "input input--mono", value: "{draft().branch}", oninput: move |event| draft.write().branch = event.value() } } else { select { class: "select select--mono", value: "{draft().branch}", onchange: move |event| draft.write().branch = event.value(), for branch in branches() { option { value: "{branch}", "{branch}" } } } } button { class: "btn btn--icon", title: "重新拉取分支", disabled: loading_branches(), onclick: move |_| branch_refresh += 1, Icon { width: 15, height: 15, icon: LdRefreshCw } } } }
                 if is_new && !groups.is_empty() { div { class: "field", label { class: "field__label", "初始参数" } select { class: "select", value: "{copy_from}", onchange: move |event| copy_from.set(event.value()), option { value: "", selected: copy_from().is_empty(), "使用参数默认值" } for group in groups { option { value: "{group.id}", selected: group.id == copy_from(), "从 {group.name} 复制" } } } } }
             }
-            div { class: "drawer__foot", button { class: "btn", onclick: move |event| on_cancel.call(event), "取消" } button { class: "btn btn--primary", disabled: saving() || draft().name.trim().is_empty() || draft().branch.trim().is_empty() || draft().project_id.is_empty(), onclick: move |_| { let request = TaskGroupRequest { project_id: draft().project_id, name: draft().name, description: draft().description, branch: draft().branch, params: if is_new { definitions.iter().map(|definition| (definition.key.clone(), definition.default_value.clone())).collect::<BTreeMap<_, _>>() } else { draft().params }, copy_from_group_id: (!copy_from().is_empty()).then(&*copy_from) }; let id = id.clone(); spawn(async move { saving.set(true); let result = if is_new { api::post::<TaskGroup, _>("/api/task-groups", &request).await } else { api::put::<TaskGroup, _>(&format!("/api/task-groups/{id}"), &request).await }; match result { Ok(group) => { context.success(if is_new { "任务组已创建" } else { "任务组已保存" }); on_saved.call(group); }, Err(error) => context.error(error) } saving.set(false); }); }, if saving() { "保存中…" } else { "保存" } } }
+            div { class: "drawer__foot", button { class: "btn", onclick: move |event| on_cancel.call(event), "取消" } button { class: "btn btn--primary", disabled: saving() || draft().name.trim().is_empty() || draft().branch.trim().is_empty() || draft().project_id.is_empty(), onclick: move |_| { let request = TaskGroupRequest { project_id: draft().project_id, name: draft().name, description: draft().description, branch: draft().branch, params: if is_new { definitions.iter().map(|definition| (definition.key.clone(), definition.default_value.clone())).collect::<BTreeMap<_, _>>() } else { draft().params }, copy_from_group_id: (!copy_from().is_empty()).then(&*copy_from), presets: None, hidden_params: None }; let id = id.clone(); spawn(async move { saving.set(true); let result = if is_new { api::post::<TaskGroup, _>("/api/task-groups", &request).await } else { api::put::<TaskGroup, _>(&format!("/api/task-groups/{id}"), &request).await }; match result { Ok(group) => { context.success(if is_new { "任务组已创建" } else { "任务组已保存" }); on_saved.call(group); }, Err(error) => context.error(error) } saving.set(false); }); }, if saving() { "保存中…" } else { "保存" } } }
         }
     }
 }

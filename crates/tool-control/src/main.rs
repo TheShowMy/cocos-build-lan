@@ -642,6 +642,16 @@ fn App() -> Element {
                                     small { "不进入 /api/settings，也不写入业务 data/settings.json。" }
                                 }
                                 label { class: "field wide",
+                                    span { "构建工作区目录" }
+                                    input { value: "{settings().business.workspace_root}", placeholder: "留空使用默认目录（如 E:\\lan-workspaces）", oninput: move |event| {
+                                        let mut next = settings();
+                                        next.business.workspace_root = event.value();
+                                        settings.set(next);
+                                        settings_dirty.set(true);
+                                    } }
+                                    small { "克隆的项目与构建产物会放到这里。请用短路径（盘符根级），否则 Cocos Creator 可能因路径过长在自动图集步骤崩溃；不要与旧系统的工作区共用同一目录。" }
+                                }
+                                label { class: "field",
                                     span { "Release 清单 URL" }
                                     input { r#type: "url", value: "{settings().update.release_manifest_url}", placeholder: "https://github.com/.../manifest.json", oninput: move |event| {
                                         let mut next = settings();
