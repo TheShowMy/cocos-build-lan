@@ -13,6 +13,7 @@ use crate::{
 };
 
 pub async fn delete_task(state: &AppState, task_id: &str) -> Result<(), AppError> {
+    let _edit = state.settings_edit.lock().await;
     let task = state.find_task(task_id).await?;
     let runtime = state.get_task_runtime(task_id).await?;
     if runtime.status == PackageTaskStatus::Running
@@ -131,6 +132,7 @@ pub async fn start_task_obfuscation(state: AppState, task_id: String) -> Result<
         ));
     }
 
+    let operation = state.operation().await?;
     state.try_start_build().await?;
     if let Err(error) = state
         .prepare_tasks_for_build(std::slice::from_ref(&task_id))
@@ -141,12 +143,27 @@ pub async fn start_task_obfuscation(state: AppState, task_id: String) -> Result<
     }
 
     tokio::spawn(async move {
+        let _operation = operation;
         let _restart_guard = state.restart_guard("单独混淆任务");
-        if let Err(error) = run_task_obfuscation_job(state.clone(), &task_id).await {
+        state.set_active_task(Some(task_id.clone())).await;
+        if let Err(error) = super::build::cancel_on_request(
+            &state,
+            run_task_obfuscation_job(state.clone(), &task_id),
+        )
+        .await
+        {
             error!(task_id, error = %error, "单独混淆执行失败");
+            let canceled = matches!(error, AppError::Canceled(_));
             let updated_runtime = state
                 .update_task_runtime(&task_id, RuntimeFlushMode::Immediate, |runtime| {
-                    runtime.status = PackageTaskStatus::Failed;
+                    runtime.status = if canceled {
+                        PackageTaskStatus::Canceled
+                    } else {
+                        PackageTaskStatus::Failed
+                    };
+                    if canceled {
+                        runtime.step_label = "混淆已取消".into();
+                    }
                     if runtime.progress == 0 {
                         runtime.progress = 5;
                     }

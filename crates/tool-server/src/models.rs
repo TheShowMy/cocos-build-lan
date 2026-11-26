@@ -44,10 +44,8 @@ pub struct PublicSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PublicSettingsUpdate {
-    #[serde(default)]
-    pub engines: Vec<Engine>,
     #[serde(default)]
     pub projects: Vec<Project>,
     #[serde(default)]
@@ -65,8 +63,7 @@ impl From<&AppSettings> for PublicSettings {
             package_tasks: value.package_tasks.clone(),
             task_groups: value.task_groups.clone(),
             param_definitions: value.param_definitions.clone(),
-            git_credentials_configured: !value.git_config.username.trim().is_empty()
-                || !value.git_config.password.trim().is_empty(),
+            git_credentials_configured: !value.git_config.password.is_empty(),
         }
     }
 }
@@ -172,6 +169,34 @@ pub struct GroupParamPreset {
     pub params: BTreeMap<String, Value>,
 }
 
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BuildScheme {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    pub branch: String,
+    #[serde(default)]
+    pub params: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemeApplied {
+    pub scheme_id: String,
+    pub group: TaskGroup,
+    pub task_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct PlaceholderInfo {
+    pub reference: String,
+    pub description: String,
+    pub builtin: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskGroup {
@@ -186,6 +211,8 @@ pub struct TaskGroup {
     #[serde(default)]
     pub presets: Vec<GroupParamPreset>,
     #[serde(default)]
+    pub schemes: Option<Vec<BuildScheme>>,
+    #[serde(default)]
     pub hidden_params: Vec<String>,
     #[serde(default)]
     pub order: u32,
@@ -199,6 +226,8 @@ pub enum ParamKind {
     Number,
     Switch,
     Select,
+    Identifier,
+    Version,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -468,6 +497,14 @@ pub struct BuildTaskStatusDto {
 #[serde(rename_all = "camelCase")]
 pub struct BuildStatusResponse {
     #[serde(default)]
+    pub build_in_progress: bool,
+    #[serde(default)]
+    pub active_task_id: Option<String>,
+    #[serde(default)]
+    pub queued_task_ids: Vec<String>,
+    #[serde(default)]
+    pub cancel_requested: bool,
+    #[serde(default)]
     pub package_tasks: Vec<BuildTaskStatusDto>,
 }
 
@@ -510,6 +547,8 @@ pub struct TaskGroupRequest {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskGroupParamsRequest {
+    #[serde(default)]
+    pub scheme_id: Option<String>,
     pub branch: String,
     #[serde(default)]
     pub params: BTreeMap<String, Value>,
@@ -547,23 +586,6 @@ pub struct PackageTaskRequest {
 pub struct PackageTaskReorderRequest {
     pub task_group_id: String,
     pub task_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LegacyImportRequest {
-    pub data_dir: String,
-}
-
-#[derive(Debug, Clone, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct LegacyImportPreview {
-    pub settings_found: bool,
-    pub prep_project_count: usize,
-    pub project_count: usize,
-    pub task_count: usize,
-    pub task_group_count: usize,
-    pub imported: bool,
 }
 
 fn default_dead_code_injection_count() -> u32 {

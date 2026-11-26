@@ -3,8 +3,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::process::Command;
 use serde::Deserialize;
-use tokio::process::Command;
 use walkdir::WalkDir;
 
 use super::obfuscation::{prepare_task_obfuscation_dict, resolve_engine_build_dir_from_game_js};
@@ -82,7 +82,8 @@ pub async fn run_code_package_ast_obfuscation(
         return Err(format!("未找到 AST 混淆脚本: {}", script_path.display()));
     }
 
-    let mut command = Command::new("node");
+    let mut command =
+        Command::new(std::env::var_os("COCOS_BUILD_LAN_NODE_EXE").unwrap_or_else(|| "node".into()));
     command
         .arg(&script_path)
         .arg("--input")

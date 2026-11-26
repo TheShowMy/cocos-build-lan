@@ -4,9 +4,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::process::Command;
 use chrono::Local;
 use serde_json::Value;
-use tokio::{fs, process::Command};
+use tokio::fs;
 use walkdir::WalkDir;
 
 use crate::{
@@ -424,7 +425,8 @@ async fn build_task_prep_execution_context(
         &code_package_path,
         &remote_package_path,
     )
-    .await;
+    .await
+    .with_definitions(&state.get_settings().await.param_definitions);
 
     Ok(TaskPrepExecutionContext {
         task,
@@ -1114,7 +1116,7 @@ fn default_lib_py() -> &'static str {
     "## 你的逻辑写在这里，不要动 main.py 里的代码\n## data 目录是数据目录，动态生成的资源请放到 data/ 下面\n## 退出码说明：0 表示成功，非 0 表示失败，系统会记录对应退出码\nimport sys\nfrom models import Person\n\ndef process_person(person: Person):\n    print(person)\n    sys.exit(0)\n"
 }
 
-fn build_prep_args(
+pub(crate) fn build_prep_args(
     prep_project: &PrepProject,
     params: &HashMap<String, Value>,
     context: &PlaceholderContext,
@@ -1181,13 +1183,14 @@ mod tests {
             path: "/engine".to_string(),
         };
 
-        PlaceholderContext::new(
+        PlaceholderContext::new_with_params(
             &project,
             &engine,
             "main".to_string(),
             "/project".to_string(),
             String::new(),
             String::new(),
+            &std::collections::BTreeMap::from([("build_mode".into(), json!("release"))]),
         )
     }
 

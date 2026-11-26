@@ -8,7 +8,17 @@ use crate::{
 };
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/api/settings", get(get_settings).put(save_settings))
+    Router::new()
+        .route("/api/parameters/placeholders", get(get_placeholders))
+        .route("/api/settings", get(get_settings).put(save_settings))
+}
+
+async fn get_placeholders(
+    State(state): State<AppState>,
+) -> Json<Vec<crate::models::PlaceholderInfo>> {
+    Json(services::parameters::placeholder_catalog(
+        &state.get_settings().await.param_definitions,
+    ))
 }
 
 async fn get_settings(State(state): State<AppState>) -> Result<Json<PublicSettings>, AppError> {
@@ -36,6 +46,28 @@ mod tests {
 
     use super::*;
     use crate::models::{AppSettings, GitConfig, PackageTask};
+
+    #[tokio::test]
+    async fn public_settings_reject_engine_and_credential_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::load(dir.path().to_path_buf()).await;
+        for field in ["engines", "gitConfig", "workspaceRoot"] {
+            let payload = serde_json::json!({field: []});
+            let response = router()
+                .with_state(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/settings")
+                        .method("PUT")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
 
     #[tokio::test]
     async fn public_settings_never_expose_git_credentials() {
@@ -124,11 +156,9 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "engines": [],
                             "projects": [],
                             "feishuBots": [],
-                            "paramDefinitions": [],
-                            "packageTasks": []
+                            "paramDefinitions": [services::parameters::builtin_version()]
                         })
                         .to_string(),
                     ))

@@ -1,9 +1,10 @@
+use super::machine::{AccessContext, LOCAL_ONLY, ServiceSettings, pick_path};
 use dioxus::prelude::*;
 use dioxus_free_icons::{
     Icon,
     icons::ld_icons::{
-        LdCheck, LdChevronDown, LdChevronUp, LdCircleAlert, LdFolderCog, LdKeyRound, LdPencil,
-        LdPlus, LdRefreshCw, LdSettings2, LdTrash2, LdX,
+        LdChevronDown, LdChevronUp, LdFolderCog, LdPencil, LdPlus, LdRefreshCw, LdSettings2,
+        LdTrash2, LdX,
     },
 };
 use serde_json::{Value, json};
@@ -27,6 +28,8 @@ pub fn Settings() -> Element {
     let mut engine_editor = use_signal(|| None::<(Option<String>, Engine)>);
     let mut project_editor = use_signal(|| None::<Project>);
     let mut bot_editor = use_signal(|| None::<FeishuBot>);
+    let mut param_saving = use_signal(|| false);
+    let mut param_error = use_signal(String::new);
     let mut param_editor = use_signal(|| None::<(Option<String>, ParamDefinition)>);
     let mut delete_engine = use_signal(|| None::<String>);
     let mut delete_project = use_signal(|| None::<Project>);
@@ -35,11 +38,15 @@ pub fn Settings() -> Element {
     let mut initialize_project = use_signal(|| None::<Project>);
     let mut cleanup_project = use_signal(|| None::<Project>);
     let mut action_busy = use_signal(String::new);
+    let mut can_manage = use_signal(|| false);
 
     use_effect(move || {
         let _ = refresh();
         spawn(async move {
             loading.set(true);
+            if let Ok(access) = api::get::<AccessContext>("/api/access-context").await {
+                can_manage.set(access.can_manage_machine);
+            }
             match api::get::<PublicSettings>("/api/settings").await {
                 Ok(value) => {
                     settings.set(value);
@@ -68,19 +75,22 @@ pub fn Settings() -> Element {
             aside { class: "page__side settings-nav",
                 nav { class: "anchor-nav", "aria-label": "设置分区",
                     a { href: "#sec-engine", class: "is-active", "引擎与项目" }
-                    a { href: "#sec-git", "Git 凭据" }
+                    a { href: "#sec-service", "服务设置 / Git 凭据" }
                     a { href: "#sec-feishu", "飞书机器人" }
                     a { href: "#sec-params", "任务参数" }
                 }
             }
             main { class: "page__main settings-col",
                 div { class: "toolbar settings-toolbar", div { h1 { "设置" } p { class: "toolbar__subtitle", "部署机路径、项目仓库和构建参数" } } span { class: "spacer" } button { class: "btn btn--icon", title: "刷新设置", onclick: move |_| refresh += 1, Icon { width: 16, height: 16, icon: LdRefreshCw } } }
+                ServiceSettings { can_manage: can_manage(), on_saved: move |_| refresh += 1 }
+                if settings().engines.is_empty() || !settings().git_credentials_configured { p { class: "section-copy", "首次使用：请在服务所在机器配置引擎和 Git 凭据，然后添加项目并初始化工作区。" } }
                 section { class: "settings-section", id: "sec-engine",
                     div { class: "section-heading",
                         div { Icon { width: 17, height: 17, icon: LdFolderCog } strong { "Cocos 引擎" } }
                         span { class: "spacer" }
-                        button { class: "btn btn--sm", onclick: move |_| engine_editor.set(Some((None, Engine::default()))), Icon { width: 14, height: 14, icon: LdPlus } "添加引擎" }
+                        button { class: "btn btn--sm", disabled: !can_manage(), onclick: move |_| engine_editor.set(Some((None, Engine::default()))), Icon { width: 14, height: 14, icon: LdPlus } "添加引擎" }
                     }
+                    if !can_manage() { p { class: "section-copy", "{LOCAL_ONLY}" } }
                     if settings().engines.is_empty() {
                         div { class: "empty-inline", "还没有配置引擎路径" }
                     } else {
@@ -90,10 +100,10 @@ pub fn Settings() -> Element {
                                 tbody { for engine in settings().engines {
                                     tr { key: "{engine.name}",
                                         td { strong { "{engine.name}" } }
-                                        td { class: "mono path-cell", "{engine.path}" }
+                                        td { class: "mono path-cell", if can_manage() { "{engine.path}" } else { "仅本机设置" } }
                                         td { div { class: "table__actions",
-                                            button { class: "btn btn--sm", onclick: { let engine = engine.clone(); move |_| engine_editor.set(Some((Some(engine.name.clone()), engine.clone()))) }, Icon { width: 14, height: 14, icon: LdPencil } "编辑" }
-                                            button { class: "btn btn--sm btn--danger btn--icon", title: "删除引擎", onclick: move |_| delete_engine.set(Some(engine.name.clone())), Icon { width: 14, height: 14, icon: LdTrash2 } }
+                                            button { class: "btn btn--sm", disabled: !can_manage(), onclick: { let engine = engine.clone(); move |_| engine_editor.set(Some((Some(engine.name.clone()), engine.clone()))) }, Icon { width: 14, height: 14, icon: LdPencil } "编辑" }
+                                            button { class: "btn btn--sm btn--danger btn--icon", title: "删除引擎", disabled: !can_manage(), onclick: move |_| delete_engine.set(Some(engine.name.clone())), Icon { width: 14, height: 14, icon: LdTrash2 } }
                                         } }
                                     }
                                 } }
@@ -117,18 +127,6 @@ pub fn Settings() -> Element {
                             }
                         }
                     }
-                }
-
-                section { class: "settings-section", id: "sec-git",
-                    div { class: "section-heading",
-                        div { Icon { width: 17, height: 17, icon: LdKeyRound } strong { "Git 凭据" } }
-                        span { class: "spacer" }
-                        span { class: if settings().git_credentials_configured { "tag tag--ok" } else { "tag tag--warn" },
-                            if settings().git_credentials_configured { Icon { width: 13, height: 13, icon: LdCheck } "已配置" }
-                            else { Icon { width: 13, height: 13, icon: LdCircleAlert } "未配置" }
-                        }
-                    }
-                    p { class: "section-copy", "Git 用户名和 Token 只在部署机器的控制 App 中管理，局域网页面无法读取或修改其内容。" }
                 }
 
                 section { class: "settings-section", id: "sec-feishu",
@@ -157,29 +155,41 @@ pub fn Settings() -> Element {
 
                 section { class: "settings-section", id: "sec-params",
                     div { class: "section-heading", strong { "任务参数配置" } span { class: "spacer" } button { class: "btn btn--sm", onclick: move |_| param_editor.set(Some((None, ParamDefinition::default()))), Icon { width: 14, height: 14, icon: LdPlus } "添加参数" } }
-                    p { class: "section-copy", "参数按顺序显示在任务组详情中；修改类型时，不兼容的旧值会恢复为新默认值。" }
+                    p { class: "section-copy", "参数按顺序显示在任务组详情中；英文标识保存时统一转小写，非法值或冲突会阻止保存；其他类型沿用现有规则。" }
                     if settings().param_definitions.is_empty() {
                         div { class: "empty-inline", "没有任务参数定义" }
                     } else {
                         div { class: "table-panel table-panel--flush",
                             table { class: "table",
                                 thead { tr { th { "显示名 / key" } th { "类型" } th { "默认值" } th { "使用" } th { class: "table__actions-head", "操作" } } }
-                                tbody { for (index, definition) in settings().param_definitions.iter().cloned().enumerate() {
+                                tbody { for (index, definition) in settings().param_definitions.iter().cloned().enumerate().filter(|(_, d)| d.key != "version") {
                                     ParameterRow { index, definition, settings, on_edit: move |value: ParamDefinition| param_editor.set(Some((Some(value.key.clone()), value))), on_delete: move |value: ParamDefinition| delete_param.set(Some(value)) }
                                 } }
                             }
                         }
                     }
                 }
+                section { class: "settings-section builtin-parameters",
+                    div { class: "section-heading", strong { "系统内置参数与占位符" } }
+                    p { class: "hint", "version：版本号类型，必填；具体值在任务组、构建方案和参数预设填写。定义不可编辑。version_prefix 为只读派生值，同时用于资源仓库分支。" }
+                    crate::package_ui::BuiltinPlaceholders {}
+                }
             }
         }
 
-        if let Some((original, value)) = engine_editor() { EngineEditor { value, on_cancel: move |_| engine_editor.set(None), on_save: move |engine: Engine| { let mut next = settings(); if let Some(original) = &original { if let Some(slot) = next.engines.iter_mut().find(|item| item.name == *original) { *slot = engine; } } else { next.engines.push(engine); } engine_editor.set(None); save_settings(next, settings, context); } } }
+        if let Some((original, value)) = engine_editor() { EngineEditor { value, on_cancel: move |_| engine_editor.set(None), on_save: move |engine: Engine| { let mut next = settings(); if let Some(original) = &original { if let Some(slot) = next.engines.iter_mut().find(|item| item.name == *original) { *slot = engine; } } else { next.engines.push(engine); } engine_editor.set(None); save_engines(next.engines, settings, context); } } }
         if let Some(value) = project_editor() { ProjectEditor { value, engines: settings().engines, on_cancel: move |_| project_editor.set(None), on_save: move |project: Project| { let mut next = settings(); if project.id.is_empty() { next.projects.push(project); } else if let Some(slot) = next.projects.iter_mut().find(|item| item.id == project.id) { *slot = project; } project_editor.set(None); save_settings(next, settings, context); } } }
         if let Some(value) = bot_editor() { BotEditor { value, on_cancel: move |_| bot_editor.set(None), on_save: move |bot: FeishuBot| { let mut next = settings(); if bot.id.is_empty() { next.feishu_bots.push(bot); } else if let Some(slot) = next.feishu_bots.iter_mut().find(|item| item.id == bot.id) { *slot = bot; } bot_editor.set(None); save_settings(next, settings, context); } } }
-        if let Some((original, value)) = param_editor() { ParamEditor { value, on_cancel: move |_| param_editor.set(None), on_save: move |definition: ParamDefinition| { let mut next = settings(); if let Some(original) = &original { if let Some(slot) = next.param_definitions.iter_mut().find(|item| item.key == *original) { *slot = definition; } } else { next.param_definitions.push(definition); } param_editor.set(None); save_settings(next, settings, context); } } }
+        if let Some((original, value)) = param_editor() { ParamEditor { value, saving: param_saving(), error: param_error(), on_cancel: move |_| { if !param_saving() { param_editor.set(None); param_error.set(String::new()); } }, on_save: move |definition: ParamDefinition| { let mut next = settings(); if let Some(original) = &original { if let Some(slot) = next.param_definitions.iter_mut().find(|item| item.key == *original) { *slot = definition; } } else { next.param_definitions.push(definition); }
+        if param_saving() { return; } param_saving.set(true); param_error.set(String::new()); spawn(async move {
+            match api::put::<PublicSettings, _>("/api/settings", &PublicSettingsUpdate::from(&next)).await {
+                Ok(saved) => { settings.set(saved); param_editor.set(None); context.success("参数已保存"); },
+                Err(error) => { param_error.set(error.clone()); context.error(error); }
+            }
+            param_saving.set(false);
+        }); } } }
 
-        if let Some(name) = delete_engine() { ConfirmDialog { title: "删除引擎".to_owned(), message: format!("确认删除引擎「{name}」？仍被项目使用时服务端会拒绝。"), confirm_label: "删除".to_owned(), danger: true, on_cancel: move |_| delete_engine.set(None), on_confirm: move |_| { let mut next = settings(); next.engines.retain(|engine| engine.name != name); delete_engine.set(None); save_settings(next, settings, context); } } }
+        if let Some(name) = delete_engine() { ConfirmDialog { title: "删除引擎".to_owned(), message: format!("确认删除引擎「{name}」？仍被项目使用时服务端会拒绝。"), confirm_label: "删除".to_owned(), danger: true, on_cancel: move |_| delete_engine.set(None), on_confirm: move |_| { let mut next = settings(); next.engines.retain(|engine| engine.name != name); delete_engine.set(None); save_engines(next.engines, settings, context); } } }
         if let Some(project) = delete_project() { ConfirmDialog { title: "删除项目".to_owned(), message: format!("确认删除项目「{}」？仍有任务组时服务端会拒绝，工作区文件不会随配置删除。", project.name), confirm_label: "删除".to_owned(), danger: true, on_cancel: move |_| delete_project.set(None), on_confirm: move |_| { let mut next = settings(); next.projects.retain(|item| item.id != project.id); delete_project.set(None); save_settings(next, settings, context); } } }
         if let Some(bot) = delete_bot() { ConfirmDialog { title: "删除飞书机器人".to_owned(), message: format!("确认删除「{}」？后续构建将不再向它发送通知。", bot.name), confirm_label: "删除".to_owned(), danger: true, on_cancel: move |_| delete_bot.set(None), on_confirm: move |_| { let mut next = settings(); next.feishu_bots.retain(|item| item.id != bot.id); delete_bot.set(None); save_settings(next, settings, context); } } }
         if let Some(definition) = delete_param() { ConfirmDialog { title: "删除任务参数".to_owned(), message: format!("参数「{}」当前被 {} 个任务组使用。确认删除并清理这些已保存值？", definition.label, parameter_usage(&settings(), &definition.key)), confirm_label: "删除参数".to_owned(), danger: true, on_cancel: move |_| delete_param.set(None), on_confirm: move |_| { let mut next = settings(); next.param_definitions.retain(|item| item.key != definition.key); delete_param.set(None); save_settings(next, settings, context); } } }
@@ -230,7 +240,11 @@ fn ParameterRow(
 ) -> Element {
     let context = use_context::<AppContext>();
     let count = parameter_usage(&settings(), &definition.key);
-    let total = settings().param_definitions.len();
+    let total = settings()
+        .param_definitions
+        .iter()
+        .filter(|d| d.key != "version")
+        .count();
     rsx! {
         tr { key: "{definition.key}",
             td { strong { "{definition.label}" } br {} span { class: "hint mono", "{definition.key}" } }
@@ -254,9 +268,12 @@ fn EngineEditor(
     on_save: EventHandler<Engine>,
 ) -> Element {
     let mut draft = use_signal(|| value);
+    let mut picking = use_signal(|| false);
+    let context = use_context::<AppContext>();
     rsx! { ModalFrame { title: "引擎配置".to_owned(), on_cancel,
         div { class: "field", label { class: "field__label", "引擎名称" } input { class: "input", value: "{draft().name}", oninput: move |event| draft.write().name = event.value() } }
         div { class: "field", label { class: "field__label", "部署机路径" } input { class: "input input--mono", placeholder: "例如 C:\\ProgramData\\cocos\\Creator\\3.8.5", value: "{draft().path}", oninput: move |event| draft.write().path = event.value() } p { class: "hint", "填写部署机器上的实际 Cocos Creator 路径。" } }
+        button { class: "btn", disabled: picking(), onclick: move |_| { picking.set(true); spawn(async move { match pick_path("engine").await { Ok(Some(path)) => draft.write().path = path, Ok(None) => {}, Err(error) => context.error(error) } picking.set(false); }); }, if picking() { "选择中…" } else { "选择 CocosCreator.exe…" } }
         div { class: "drawer__foot", button { class: "btn", onclick: move |event| on_cancel.call(event), "取消" } button { class: "btn btn--primary", disabled: draft().name.trim().is_empty() || draft().path.trim().is_empty(), onclick: move |_| on_save.call(draft()), "保存" } }
     } }
 }
@@ -273,7 +290,7 @@ fn ProjectEditor(
         div { class: "field", label { class: "field__label", "项目名称" } input { class: "input", value: "{draft().name}", oninput: move |event| draft.write().name = event.value() } }
         div { class: "field", label { class: "field__label", "关联引擎" } select { class: "select", value: "{draft().engine_name}", onchange: move |event| draft.write().engine_name = event.value(), for engine in engines { option { value: "{engine.name}", "{engine.name}" } } } }
         div { class: "field", label { class: "field__label", "Git 地址" } input { class: "input input--mono", value: "{draft().git_url}", oninput: move |event| draft.write().git_url = event.value() } }
-        p { class: "hint", "修改 Git 地址后请重新初始化工作区；凭据由本机控制 App 提供。" }
+        p { class: "hint", "修改 Git 地址后请重新初始化工作区；凭据在服务所在机器的 Web 设置页管理。" }
         div { class: "drawer__foot", button { class: "btn", onclick: move |event| on_cancel.call(event), "取消" } button { class: "btn btn--primary", disabled: draft().name.trim().is_empty() || draft().engine_name.is_empty() || draft().git_url.trim().is_empty(), onclick: move |_| on_save.call(draft()), "保存" } }
     } }
 }
@@ -295,18 +312,26 @@ fn BotEditor(
 #[component]
 fn ParamEditor(
     value: ParamDefinition,
+    saving: bool,
+    error: String,
     on_cancel: EventHandler<MouseEvent>,
     on_save: EventHandler<ParamDefinition>,
 ) -> Element {
     let mut draft = use_signal(|| value);
     let options = draft().options.join("\n");
     rsx! { ModalFrame { title: "任务参数定义".to_owned(), on_cancel,
+        if !error.is_empty() { p { class: "field-error", "{error}" } }
+        fieldset { class: "parameter-fields", disabled: saving,
         div { class: "form-grid form-grid--two", div { class: "field", label { class: "field__label", "显示名" } input { class: "input", value: "{draft().label}", oninput: move |event| draft.write().label = event.value() } } div { class: "field", label { class: "field__label", "key" } input { class: "input input--mono", value: "{draft().key}", oninput: move |event| draft.write().key = event.value() } } }
-        div { class: "form-grid form-grid--two", div { class: "field", label { class: "field__label", "类型" } select { class: "select", value: "{param_kind_value(&draft().kind)}", onchange: move |event| { let kind = parse_param_kind(&event.value()); draft.write().kind = kind.clone(); draft.write().default_value = default_for_kind(&kind); }, option { value: "text", "文本" } option { value: "number", "数字" } option { value: "switch", "开关" } option { value: "select", "选择" } } } label { class: "checkbox param-required", input { r#type: "checkbox", checked: draft().required, onchange: move |event| draft.write().required = event.checked() } "必填参数" } }
-        if draft().kind == ParamKind::Select { div { class: "field", label { class: "field__label", "选项（每行一个）" } textarea { class: "textarea textarea--mono", value: "{options}", oninput: move |event| draft.write().options = event.value().lines().map(str::trim).filter(|value| !value.is_empty()).map(ToOwned::to_owned).collect() } } }
-        div { class: "field", label { class: "field__label", "默认值" } if draft().kind == ParamKind::Switch { label { class: "switch", input { r#type: "checkbox", checked: draft().default_value.as_bool().unwrap_or(false), onchange: move |event| draft.write().default_value = Value::Bool(event.checked()) } i {} } } else if draft().kind == ParamKind::Select { { let selected_value = display_value(&draft().default_value); rsx! { select { class: "select", value: "{selected_value}", onchange: move |event| draft.write().default_value = Value::String(event.value()), option { value: "", selected: selected_value.is_empty(), "请选择" } for option in draft().options { option { key: "{option}", value: "{option}", selected: option == selected_value, "{option}" } } } } } } else { input { class: "input input--mono", value: "{display_value(&draft().default_value)}", oninput: move |event| draft.write().default_value = if draft().kind == ParamKind::Number { crate::models::parse_number_value(&event.value()) } else { Value::String(event.value()) } } } }
+        div { class: "form-grid form-grid--two", div { class: "field", label { class: "field__label", "类型" } select { class: "select", value: "{param_kind_value(&draft().kind)}", onchange: move |event| { let kind = parse_param_kind(&event.value()); draft.write().kind = kind; draft.write().default_value = default_for_kind(&kind); }, option { value: "text", "文本" } option { value: "number", "数字" } option { value: "switch", "开关" } option { value: "select", "选择" } option { value: "identifier", "英文标识" } option { value: "version", "版本号" } } } label { class: "checkbox param-required", input { r#type: "checkbox", checked: draft().required, onchange: move |event| draft.write().required = event.checked() } "必填参数" } }
+        if matches!(draft().kind, ParamKind::Select | ParamKind::Identifier) { div { class: "field", label { class: "field__label", "选项（每行一个；英文标识可留空使用文本输入）" } textarea { class: "textarea textarea--mono", value: "{options}", oninput: move |event| draft.write().options = if draft().kind == ParamKind::Identifier { event.value().lines().map(ToOwned::to_owned).collect() } else { event.value().lines().map(str::trim).filter(|value| !value.is_empty()).map(ToOwned::to_owned).collect() } } } }
+        div { class: "field", label { class: "field__label", "默认值" } if draft().kind == ParamKind::Switch { label { class: "switch", input { r#type: "checkbox", checked: draft().default_value.as_bool().unwrap_or(false), onchange: move |event| draft.write().default_value = Value::Bool(event.checked()) } i {} } } else if draft().kind == ParamKind::Select || (draft().kind == ParamKind::Identifier && !draft().options.is_empty()) { { let selected_value = display_value(&draft().default_value); rsx! { select { class: "select", value: "{selected_value}", onchange: move |event| draft.write().default_value = Value::String(event.value()), option { value: "", selected: selected_value.is_empty(), "请选择" } for option in draft().options { option { key: "{option}", value: "{option}", selected: option == selected_value, "{option}" } } } } } } else { input { class: "input input--mono", value: "{display_value(&draft().default_value)}", oninput: move |event| draft.write().default_value = if draft().kind == ParamKind::Number { crate::models::parse_number_value(&event.value()) } else { Value::String(event.value()) } } } }
+        if draft().kind == ParamKind::Identifier { p { class: "hint", "只允许英文字母和下划线；保存时自动转为小写。" } }
+        if draft().kind == ParamKind::Version { p { class: "hint", "至少两段数字，以点分隔，例如 01.2.3；保留前导零。自动生成 key_prefix 占位符。" } }
+        crate::package_ui::PlaceholderHelp {}
         div { class: "field", label { class: "field__label", "描述" } input { class: "input", value: "{draft().description}", oninput: move |event| draft.write().description = event.value() } }
-        div { class: "drawer__foot", button { class: "btn", onclick: move |event| on_cancel.call(event), "取消" } button { class: "btn btn--primary", disabled: draft().label.trim().is_empty() || draft().key.trim().is_empty(), onclick: move |_| on_save.call(draft()), "保存" } }
+        div { class: "drawer__foot", button { class: "btn", onclick: move |event| on_cancel.call(event), "取消" } button { class: "btn btn--primary", disabled: saving || draft().label.trim().is_empty() || draft().key.trim().is_empty(), onclick: move |_| on_save.call(draft()), if saving { "保存中…" } else { "保存" } } }
+        }
     } }
 }
 
@@ -384,6 +409,8 @@ fn parse_param_kind(value: &str) -> ParamKind {
         "number" => ParamKind::Number,
         "switch" => ParamKind::Switch,
         "select" => ParamKind::Select,
+        "identifier" => ParamKind::Identifier,
+        "version" => ParamKind::Version,
         _ => ParamKind::Text,
     }
 }
@@ -394,13 +421,29 @@ fn param_kind_value(value: &ParamKind) -> &'static str {
         ParamKind::Number => "number",
         ParamKind::Switch => "switch",
         ParamKind::Select => "select",
+        ParamKind::Identifier => "identifier",
+        ParamKind::Version => "version",
     }
 }
 
 fn default_for_kind(value: &ParamKind) -> Value {
     match value {
-        ParamKind::Text | ParamKind::Select => Value::String(String::new()),
+        ParamKind::Text | ParamKind::Select | ParamKind::Identifier | ParamKind::Version => {
+            Value::String(String::new())
+        }
         ParamKind::Number => json!(0),
         ParamKind::Switch => Value::Bool(false),
     }
+}
+
+fn save_engines(engines: Vec<Engine>, mut signal: Signal<PublicSettings>, context: AppContext) {
+    spawn(async move {
+        match api::put::<Vec<Engine>, _>("/api/local/engines", &engines).await {
+            Ok(value) => {
+                signal.write().engines = value;
+                context.success("引擎设置已保存");
+            }
+            Err(error) => context.error(error),
+        }
+    });
 }

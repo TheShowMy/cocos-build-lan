@@ -327,8 +327,7 @@ async fn execute_prep_target(
     let prep_project = preps::load_prep_project(state, &target.prep_project_id)
         .await
         .map_err(AppError::internal)?;
-    let params_text =
-        serde_json::to_string_pretty(&target.params).unwrap_or_else(|_| "{}".to_string());
+    let params_text = prep_input_params_text(&prep_project, &target.params, placeholder_context)?;
     let step_prefix = match (branch_label, branch_target_index) {
         (Some(branch), Some(index)) => {
             format!("{stage_label}第 {step_index} 项{branch}第 {index} 个准备项目")
@@ -386,4 +385,93 @@ async fn execute_prep_target(
     .await?;
 
     Ok(())
+}
+
+fn prep_input_params_text(
+    prep_project: &crate::models::PrepProject,
+    params: &std::collections::HashMap<String, serde_json::Value>,
+    context: &PlaceholderContext,
+) -> Result<String, AppError> {
+    let args =
+        preps::build_prep_args(prep_project, params, context).map_err(AppError::validation)?;
+    let inputs = args
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| (pair[0].trim_start_matches("--"), pair[1].as_str()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    serde_json::to_string_pretty(&inputs).map_err(|error| AppError::internal(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::models::{
+        BuildMode, Engine, PrepParam, PrepParamType, PrepParamValueSource, PrepProject, Project,
+    };
+
+    #[test]
+    fn input_log_should_include_resolved_fixed_runtime_and_system_params() {
+        let param = |name: &str, fixed_value: Option<serde_json::Value>| PrepParam {
+            name: name.to_string(),
+            param_type: PrepParamType::Str,
+            value_source: if fixed_value.is_some() {
+                PrepParamValueSource::Fixed
+            } else {
+                PrepParamValueSource::Runtime
+            },
+            optional: true,
+            options: Vec::new(),
+            fixed_value,
+        };
+        let prep_project = PrepProject {
+            id: "prep".to_string(),
+            name: "配置拉取".to_string(),
+            description: String::new(),
+            path: String::new(),
+            create_time: String::new(),
+            params: vec![
+                param("build_mode", Some(json!("${build_mode}"))),
+                param("censor_switch", Some(json!("${review_mode}"))),
+                param("test_branch", None),
+                param("optional_branch", None),
+            ],
+        };
+        let context = PlaceholderContext::new_with_params(
+            &Project {
+                build_mode: BuildMode::Test,
+                review_mode: true,
+                ..Project::default()
+            },
+            &Engine::default(),
+            "master".to_string(),
+            "D:/project".to_string(),
+            String::new(),
+            String::new(),
+            &std::collections::BTreeMap::from([
+                ("build_mode".into(), json!("test")),
+                ("review_mode".into(), json!(true)),
+            ]),
+        );
+        let params = HashMap::from([
+            ("test_branch".to_string(), json!("master")),
+            ("build_mode".to_string(), json!("override")),
+            ("project_path".to_string(), json!("override")),
+            ("unknown".to_string(), json!("ignored")),
+        ]);
+        let text = prep_input_params_text(&prep_project, &params, &context).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            json!({
+                "build_mode": "test",
+                "censor_switch": "true",
+                "test_branch": "master",
+                "project_path": "D:/project"
+            })
+        );
+    }
 }

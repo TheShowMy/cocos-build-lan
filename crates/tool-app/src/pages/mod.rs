@@ -1,4 +1,5 @@
 mod logs;
+mod machine;
 mod package;
 mod prep;
 mod settings;

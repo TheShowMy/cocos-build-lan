@@ -20,13 +20,12 @@ use tracing::{info, warn};
 use crate::{
     error::AppError,
     models::{
-        AppSettings, BuildMode, BuildStatusResponse, BuildTaskStatusDto, Engine, GitConfig,
-        LegacyImportPreview, PackageTask, PackageTaskRuntime, PackageTaskStatus, ParamDefinition,
-        ParamKind, Project, RuntimeState, TaskGroup,
+        AppSettings, BuildStatusResponse, BuildTaskStatusDto, Engine, GitConfig, PackageTask,
+        PackageTaskRuntime, PackageTaskStatus, ParamDefinition, ParamKind, Project, RuntimeState,
+        TaskGroup,
     },
     services::settings::normalize_integral_number,
 };
-use cocos_build_lan_contract::ToolStatus;
 use cocos_build_lan_core::{RestartBlocker, RestartGuard, RestartProtection, RestartRegistry};
 
 const RUNTIME_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
@@ -53,6 +52,11 @@ pub struct AppState {
     restart_registry: RestartRegistry,
     cancel_sender: Arc<Mutex<Option<watch::Sender<bool>>>>,
     active_task_id: Arc<RwLock<Option<String>>>,
+    pub operations: Arc<RwLock<()>>,
+    pub settings_edit: Arc<Mutex<()>>,
+    queued_task_ids: Arc<RwLock<Vec<String>>>,
+    runtime_finalized: Arc<std::sync::atomic::AtomicBool>,
+    pub shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -71,8 +75,14 @@ impl AppState {
             warn!(error = %error, path = %settings_path.display(), "加载设置文件失败，将使用默认配置");
             AppSettings::default()
         });
-        let (normalized_settings, normalized_settings_changed) =
+        let (mut normalized_settings, mut normalized_settings_changed) =
             normalize_settings(loaded_settings);
+        match crate::services::parameters::normalize_identifiers(&mut normalized_settings) {
+            Ok(changed) => normalized_settings_changed |= changed,
+            Err(error) => {
+                warn!(%error, "参数规范化失败，保留原始参数，请在 Web 设置修正");
+            }
+        }
         if normalized_settings_changed {
             let static_settings = strip_runtime_from_settings(normalized_settings.clone());
             if let Err(error) = persist_settings(&settings_path, &static_settings).await {
@@ -125,6 +135,11 @@ impl AppState {
             restart_registry,
             cancel_sender: Arc::new(Mutex::new(None)),
             active_task_id: Arc::new(RwLock::new(None)),
+            operations: Arc::new(RwLock::new(())),
+            settings_edit: Arc::default(),
+            queued_task_ids: Arc::default(),
+            runtime_finalized: Arc::default(),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         state.spawn_runtime_flush_task();
         info!(
@@ -135,6 +150,44 @@ impl AppState {
             "应用状态加载完成"
         );
         state
+    }
+
+    pub async fn operation(&self) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, AppError> {
+        let guard = self.operations.clone().read_owned().await;
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(AppError::conflict("服务正在退出，无法开始新任务"));
+        }
+        Ok(guard)
+    }
+
+    pub async fn stop_all(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        if let Some(sender) = self.cancel_sender.lock().await.as_ref() {
+            let _ = sender.send(true);
+        }
+    }
+
+    pub async fn finish_shutdown(&self) -> Result<(), AppError> {
+        let queued = self.queued_task_ids.read().await.clone();
+        {
+            let mut runtime = self.runtime_state.write().await;
+            self.runtime_finalized.store(true, Ordering::SeqCst);
+            for item in &mut runtime.package_tasks {
+                if matches!(
+                    item.status,
+                    PackageTaskStatus::Running | PackageTaskStatus::Canceling
+                ) || (item.status == PackageTaskStatus::Pending
+                    && queued.contains(&item.task_id))
+                {
+                    item.status = PackageTaskStatus::Canceled;
+                    item.step_label = "服务退出，任务已取消".to_owned();
+                    item.finished_at =
+                        Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+                }
+            }
+        }
+        self.mark_runtime_updated();
+        self.flush_runtime_state().await
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -198,7 +251,18 @@ impl AppState {
             .collect::<HashSet<_>>();
         let runtime_state = self.runtime_state.read().await.clone();
 
+        // Use the queue flag as the lifecycle lock, matching finish_build.
+        let in_progress = self.build_in_progress.lock().await;
         BuildStatusResponse {
+            build_in_progress: *in_progress,
+            active_task_id: self.active_task_id.read().await.clone(),
+            queued_task_ids: self.queued_task_ids.read().await.clone(),
+            cancel_requested: self
+                .cancel_sender
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|sender| *sender.borrow()),
             package_tasks: runtime_state
                 .package_tasks
                 .into_iter()
@@ -217,10 +281,10 @@ impl AppState {
     }
 
     pub async fn save_settings(&self, settings: AppSettings) -> Result<(), AppError> {
-        let (normalized_settings, _) = normalize_settings(settings);
+        let (mut normalized_settings, _) = normalize_settings(settings);
+        crate::services::parameters::normalize_identifiers(&mut normalized_settings)?;
         let static_settings = strip_runtime_from_settings(normalized_settings);
 
-        persist_settings(&self.settings_path, &static_settings).await?;
         let filtered_runtime = {
             let task_ids = static_settings
                 .package_tasks
@@ -234,6 +298,7 @@ impl AppState {
             runtime_state.clone()
         };
         self.persist_runtime_snapshot(&filtered_runtime).await?;
+        persist_settings(&self.settings_path, &static_settings).await?;
 
         let mut current = self.settings.write().await;
         *current = static_settings;
@@ -244,34 +309,6 @@ impl AppState {
     pub async fn set_git_config(&self, git_config: GitConfig) -> Result<(), AppError> {
         *self.git_config.write().await = git_config;
         Ok(())
-    }
-
-    pub async fn control_status(&self) -> ToolStatus {
-        let settings = self.get_settings().await;
-        let runtime = self.runtime_state.read().await;
-        let running = runtime
-            .package_tasks
-            .iter()
-            .filter(|task| {
-                task.status == PackageTaskStatus::Running
-                    || task.status == PackageTaskStatus::Canceling
-            })
-            .count();
-        let completed_jobs = runtime
-            .package_tasks
-            .iter()
-            .filter(|task| task.status == PackageTaskStatus::Success)
-            .count() as u64;
-        ToolStatus {
-            summary: if running > 0 {
-                format!("正在执行 {running} 个构建任务")
-            } else if settings.git_config.username.trim().is_empty() {
-                "服务运行中，尚未在控制端配置 Git 凭据".to_owned()
-            } else {
-                "服务运行中，等待构建任务".to_owned()
-            },
-            completed_jobs,
-        }
     }
 
     pub async fn find_task_group(&self, group_id: &str) -> Result<TaskGroup, AppError> {
@@ -313,6 +350,7 @@ impl AppState {
                 branch: legacy.branch,
                 params: BTreeMap::new(),
                 presets: Vec::new(),
+                schemes: None,
                 hidden_params: Vec::new(),
                 order: 0,
             },
@@ -375,7 +413,15 @@ impl AppState {
         let updated = {
             let mut runtime_state = self.runtime_state.write().await;
             let runtime = ensure_runtime_entry(&mut runtime_state.package_tasks, task_id);
+            if self.runtime_finalized.load(Ordering::SeqCst) {
+                return Ok(runtime.clone());
+            }
+            let previous_label = runtime.step_label.clone();
+            let previous_status = runtime.status.clone();
             updater(runtime);
+            if runtime.step_label != previous_label || runtime.status != previous_status {
+                info!(task_id, stage = %runtime.step_label, status = ?runtime.status, "任务进度");
+            }
             runtime.clone()
         };
 
@@ -401,6 +447,7 @@ impl AppState {
     }
 
     pub async fn prepare_tasks_for_build(&self, task_ids: &[String]) -> Result<(), AppError> {
+        *self.queued_task_ids.write().await = task_ids.to_vec();
         {
             let settings = self.settings.read().await;
             let mut runtime_state = self.runtime_state.write().await;
@@ -412,6 +459,8 @@ impl AppState {
                     .ok_or_else(|| AppError::not_found(format!("未找到任务 {task_id}")))?;
                 let runtime = ensure_runtime_entry(&mut runtime_state.package_tasks, task_id);
                 runtime.progress = 0;
+                runtime.step_label = "等待执行".into();
+                runtime.canceling_at_unix_secs = None;
                 runtime.status = PackageTaskStatus::Pending;
                 runtime.last_error = None;
                 runtime.last_log_path = None;
@@ -423,6 +472,14 @@ impl AppState {
         self.mark_runtime_updated();
         self.flush_runtime_state().await?;
         Ok(())
+    }
+
+    pub async fn idle_queue(&self) -> Result<tokio::sync::MutexGuard<'_, bool>, AppError> {
+        let flag = self.build_in_progress.lock().await;
+        if *flag {
+            return Err(AppError::conflict("全局队列占用，无法保存或应用方案"));
+        }
+        Ok(flag)
     }
 
     pub async fn try_start_build(&self) -> Result<(), AppError> {
@@ -441,13 +498,10 @@ impl AppState {
         if active.as_deref() != Some(task_id) {
             return Err(AppError::conflict("该任务不是当前正在执行的构建任务"));
         }
-        {
-            let sender = self.cancel_sender.lock().await;
-            let Some(sender) = sender.as_ref() else {
-                return Err(AppError::conflict("当前没有可终止的打包任务"));
-            };
-            sender.send_replace(true);
-        }
+        let sender_guard = self.cancel_sender.lock().await;
+        let Some(sender) = sender_guard.as_ref() else {
+            return Err(AppError::conflict("当前没有可终止的打包任务"));
+        };
         self.update_task_runtime(task_id, RuntimeFlushMode::Immediate, |runtime| {
             runtime.status = PackageTaskStatus::Canceling;
             runtime.step_label = "正在终止子进程…".to_owned();
@@ -459,6 +513,9 @@ impl AppState {
             );
         })
         .await?;
+        // Publish cancellation after the state write so a fast worker cannot be
+        // changed back from Canceled to Canceling by this request.
+        sender.send_replace(true);
         Ok(())
     }
 
@@ -470,7 +527,20 @@ impl AppState {
             .map(watch::Sender::subscribe)
     }
 
+    pub async fn remove_queued_tasks(&self, ids: &[String]) {
+        self.queued_task_ids
+            .write()
+            .await
+            .retain(|id| !ids.contains(id));
+    }
+
     pub async fn set_active_task(&self, task_id: Option<String>) {
+        if let Some(id) = &task_id {
+            self.queued_task_ids
+                .write()
+                .await
+                .retain(|queued| queued != id);
+        }
         *self.active_task_id.write().await = task_id;
     }
 
@@ -479,6 +549,7 @@ impl AppState {
         *flag = false;
         *self.cancel_sender.lock().await = None;
         *self.active_task_id.write().await = None;
+        self.queued_task_ids.write().await.clear();
     }
 
     pub async fn is_build_in_progress(&self) -> bool {
@@ -512,59 +583,6 @@ impl AppState {
 
     pub fn workspace_project_dir(&self, project: &Project) -> PathBuf {
         self.workspaces_dir().join(&project.workspace_dir_key)
-    }
-
-    pub async fn preview_legacy_import(
-        &self,
-        data_dir: PathBuf,
-    ) -> Result<LegacyImportPreview, AppError> {
-        let settings_path = data_dir.join("settings.json");
-        let settings = load_settings(&settings_path).await?;
-        let (_, groups) = preview_task_groups(&settings);
-        let prep_project_count = count_legacy_preps(&data_dir.join("preps")).await?;
-        Ok(LegacyImportPreview {
-            settings_found: settings_path.exists(),
-            prep_project_count,
-            project_count: settings.projects.len(),
-            task_count: settings.package_tasks.len(),
-            task_group_count: groups,
-            imported: false,
-        })
-    }
-
-    pub async fn import_legacy(
-        &self,
-        data_dir: PathBuf,
-    ) -> Result<(LegacyImportPreview, GitConfig), AppError> {
-        let current = self.settings.read().await;
-        if !current.projects.is_empty()
-            || !current.package_tasks.is_empty()
-            || !current.task_groups.is_empty()
-        {
-            return Err(AppError::conflict("目标工具已有业务数据，拒绝覆盖导入"));
-        }
-        drop(current);
-        let settings_path = data_dir.join("settings.json");
-        let legacy = load_settings(&settings_path).await?;
-        if !settings_path.exists() {
-            return Err(AppError::not_found(format!(
-                "未找到旧设置文件：{}",
-                settings_path.display()
-            )));
-        }
-        let imported_git_config = legacy.git_config.clone();
-        let (normalized, _) = normalize_settings(legacy);
-        let preview = LegacyImportPreview {
-            settings_found: true,
-            prep_project_count: copy_legacy_preps(&data_dir.join("preps"), &self.preps_dir())
-                .await?,
-            project_count: normalized.projects.len(),
-            task_count: normalized.package_tasks.len(),
-            task_group_count: normalized.task_groups.len(),
-            imported: true,
-        };
-        self.save_settings(normalized).await?;
-        Ok((preview, imported_git_config))
     }
 
     fn spawn_runtime_flush_task(&self) {
@@ -621,8 +639,21 @@ pub async fn persist_settings(path: &Path, settings: &AppSettings) -> Result<(),
         fs::create_dir_all(parent).await?;
     }
 
+    use tokio::io::AsyncWriteExt;
     let content = serde_json::to_vec_pretty(settings)?;
-    fs::write(path, content).await?;
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
+    let result: Result<(), std::io::Error> = async {
+        let mut file = fs::File::create(&temporary).await?;
+        file.write_all(&content).await?;
+        file.sync_all().await?;
+        drop(file);
+        fs::rename(&temporary, path).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary).await;
+    }
+    result?;
     Ok(())
 }
 
@@ -903,6 +934,7 @@ fn normalize_settings(mut settings: AppSettings) -> (AppSettings, bool) {
                 branch,
                 params,
                 presets: Vec::new(),
+                schemes: None,
                 hidden_params: Vec::new(),
                 order: next_order,
             });
@@ -952,7 +984,7 @@ fn legacy_param_definitions() -> Vec<ParamDefinition> {
         ParamDefinition {
             key: "build_mode".to_owned(),
             label: "构建模式".to_owned(),
-            kind: ParamKind::Select,
+            kind: ParamKind::Identifier,
             options: vec!["test".to_owned(), "pre".to_owned(), "release".to_owned()],
             default_value: json!("release"),
             required: true,
@@ -1010,13 +1042,6 @@ fn apply_group_params(project: &mut Project, params: &BTreeMap<String, Value>) {
     if let Some(value) = params.get("minor_version").and_then(Value::as_u64) {
         project.minor_version = value as u32;
     }
-    if let Some(value) = params.get("build_mode").and_then(Value::as_str) {
-        project.build_mode = match value {
-            "test" => BuildMode::Test,
-            "pre" => BuildMode::Pre,
-            _ => BuildMode::Release,
-        };
-    }
     if let Some(value) = params.get("is_hot_update").and_then(Value::as_bool) {
         project.is_hot_update = value;
     }
@@ -1026,55 +1051,6 @@ fn apply_group_params(project: &mut Project, params: &BTreeMap<String, Value>) {
     if let Some(value) = params.get("review_mode").and_then(Value::as_bool) {
         project.review_mode = value;
     }
-}
-
-fn preview_task_groups(settings: &AppSettings) -> (AppSettings, usize) {
-    let (normalized, _) = normalize_settings(settings.clone());
-    let count = normalized.task_groups.len();
-    (normalized, count)
-}
-
-async fn count_legacy_preps(path: &Path) -> Result<usize, AppError> {
-    if !path.exists() {
-        return Ok(0);
-    }
-    let mut entries = fs::read_dir(path).await?;
-    let mut count = 0;
-    while entries.next_entry().await?.is_some() {
-        count += 1;
-    }
-    Ok(count)
-}
-
-async fn copy_legacy_preps(source: &Path, destination: &Path) -> Result<usize, AppError> {
-    let count = count_legacy_preps(source).await?;
-    if count == 0 {
-        return Ok(0);
-    }
-    let source = source.to_path_buf();
-    let destination = destination.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
-        for entry in walkdir::WalkDir::new(&source) {
-            let entry = entry.map_err(std::io::Error::other)?;
-            let relative = entry
-                .path()
-                .strip_prefix(&source)
-                .map_err(std::io::Error::other)?;
-            let target = destination.join(relative);
-            if entry.file_type().is_dir() {
-                std::fs::create_dir_all(target)?;
-            } else {
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::copy(entry.path(), target)?;
-            }
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|error| AppError::internal(format!("复制旧准备项目失败: {error}")))??;
-    Ok(count)
 }
 
 fn normalize_project_field(
@@ -1560,6 +1536,57 @@ mod tests {
                 .task_groups
                 .iter()
                 .any(|group| group.branch == "hotfix/1.0.1")
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_only_submitted_tasks_and_ignores_late_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::load(dir.path().to_owned()).await;
+        state
+            .save_settings(AppSettings {
+                package_tasks: ["active", "queued", "idle"]
+                    .into_iter()
+                    .map(|id| PackageTask {
+                        id: id.to_owned(),
+                        ..PackageTask::default()
+                    })
+                    .collect(),
+                ..AppSettings::default()
+            })
+            .await
+            .unwrap();
+        state
+            .prepare_tasks_for_build(&["active".into(), "queued".into()])
+            .await
+            .unwrap();
+        state
+            .update_task_runtime("active", RuntimeFlushMode::Immediate, |task| {
+                task.status = PackageTaskStatus::Running
+            })
+            .await
+            .unwrap();
+        state.stop_all().await;
+        assert!(state.operation().await.is_err());
+        state.finish_shutdown().await.unwrap();
+        state
+            .update_task_runtime("active", RuntimeFlushMode::Immediate, |task| {
+                task.status = PackageTaskStatus::Success
+            })
+            .await
+            .unwrap();
+        let restarted = AppState::load(dir.path().to_owned()).await;
+        assert_eq!(
+            restarted.get_task_runtime("active").await.unwrap().status,
+            PackageTaskStatus::Canceled
+        );
+        assert_eq!(
+            restarted.get_task_runtime("queued").await.unwrap().status,
+            PackageTaskStatus::Canceled
+        );
+        assert_eq!(
+            restarted.get_task_runtime("idle").await.unwrap().status,
+            PackageTaskStatus::Pending
         );
     }
 

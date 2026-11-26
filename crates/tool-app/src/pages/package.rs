@@ -4,8 +4,8 @@ use dioxus::{document, prelude::*};
 use dioxus_free_icons::{
     Icon,
     icons::ld_icons::{
-        LdChevronDown, LdChevronUp, LdCircleStop, LdCopy, LdGitBranch, LdHammer, LdPencil, LdPlay,
-        LdPlus, LdRefreshCw, LdSave, LdSettings, LdSparkles, LdTrash2, LdX,
+        LdChevronDown, LdChevronUp, LdCircleStop, LdCopy, LdHammer, LdPencil, LdPlay, LdPlus,
+        LdRefreshCw, LdSave, LdSettings, LdSparkles, LdTrash2, LdX,
     },
 };
 use gloo_timers::future::TimeoutFuture;
@@ -16,9 +16,12 @@ use crate::{
     models::{
         BuildStatusResponse, GroupParamPreset, ObfuscationMode, PackageTask, PackageTaskRequest,
         ParamDefinition, ParamKind, PrepParam, PrepParamType, PrepProject, PrepRunForTasksRequest,
-        PrepTaskRunResponse, Project, ProjectBranchesResponse, PublicSettings, TaskGroup,
-        TaskGroupParamsRequest, TaskGroupRequest, TaskPrepAction, TaskPrepTarget, TaskStatus,
-        parse_number_value, value_text,
+        PrepTaskRunResponse, Project, PublicSettings, TaskGroup, TaskGroupRequest, TaskPrepAction,
+        TaskPrepTarget, TaskStatus, parse_number_value, value_text,
+    },
+    package_ui::{
+        BranchCache, BranchPicker, PackageUi, PlaceholderHelp, SelectedTasks, SelectionOwners,
+        prune_branches, write_storage,
     },
 };
 
@@ -32,8 +35,15 @@ pub fn Package() -> Element {
     let mut load_error = use_signal(String::new);
     let mut poll_error = use_signal(String::new);
     let mut refresh = use_signal(|| 0u64);
-    let mut selected_group = use_signal(String::new);
-    let mut selected_tasks = use_signal(Vec::<String>::new);
+    let mut ui = use_context::<PackageUi>();
+    let mut saves = use_context::<crate::schemes::SchemeSaves>();
+    let mut selected_group = ui.selected_group;
+    let mut selected_tasks = use_context::<SelectedTasks>().0;
+    let mut selection_owners = use_context::<SelectionOwners>().0;
+    let cache = use_context::<BranchCache>();
+    let mut selection_ready = use_signal(|| false);
+    let mut status_known = use_signal(|| false);
+    let mut stop_target = use_signal(|| None::<String>);
     let mut group_editor = use_signal(|| None::<(bool, TaskGroup)>);
     let mut task_editor = use_signal(|| None::<(bool, PackageTask)>);
     let mut delete_group = use_signal(|| None::<TaskGroup>);
@@ -45,13 +55,94 @@ pub fn Package() -> Element {
     let mut batch_prep_values = use_signal(HashMap::<String, Value>::new);
     let mut batch_prep_result = use_signal(|| None::<PrepTaskRunResponse>);
     let action_busy = use_signal(String::new);
+    use_effect(move || {
+        if selection_ready() {
+            let selections = selected_tasks();
+            let owners = settings()
+                .package_tasks
+                .iter()
+                .filter(|task| selections.contains(&task.id))
+                .map(|task| (task.id.clone(), task.task_group_id.clone()))
+                .collect::<BTreeMap<_, _>>();
+            write_storage("selected-tasks", true, &owners);
+            selection_owners.set(owners);
+        }
+    });
 
     use_effect(move || {
         let _ = refresh();
+        let _ = (ui.revision)();
         spawn(async move {
             loading.set(true);
             match api::get::<PublicSettings>("/api/settings").await {
-                Ok(value) => {
+                Ok(mut value) => {
+                    value.task_groups.sort_by_key(|group| group.order);
+                    prune_branches(cache, &value.projects);
+                    let owners = selection_owners.peek().clone();
+                    selected_tasks.write().retain(|id| {
+                        value.package_tasks.iter().any(|task| {
+                            &task.id == id
+                                && owners
+                                    .get(id)
+                                    .is_none_or(|group| group == &task.task_group_id)
+                        })
+                    });
+                    {
+                        let mut entries = saves.0.write();
+                        entries.retain(|id, entry| {
+                            value.task_groups.iter().any(|g| {
+                                &g.id == id
+                                    && g.schemes.iter().flatten().any(|s| s.id == entry.scheme)
+                            })
+                        });
+                        for group in &value.task_groups {
+                            if entries.contains_key(&group.id) {
+                                continue;
+                            }
+                            let remembered = ui.active.peek().get(&group.id).cloned();
+                            if let Some(scheme) = group
+                                .schemes
+                                .iter()
+                                .flatten()
+                                .find(|s| Some(&s.id) == remembered.as_ref())
+                            {
+                                let mut tasks: Vec<_> = value
+                                    .package_tasks
+                                    .iter()
+                                    .filter(|t| t.task_group_id == group.id)
+                                    .map(|t| t.id.clone())
+                                    .collect();
+                                tasks.sort();
+                                let ids: Vec<_> = tasks
+                                    .iter()
+                                    .filter(|id| scheme.task_ids.contains(id))
+                                    .cloned()
+                                    .collect();
+                                selected_tasks.write().retain(|id| !tasks.contains(id));
+                                selected_tasks.write().extend(ids.clone());
+                                entries.insert(
+                                    group.id.clone(),
+                                    crate::schemes::SelectionSave {
+                                        scheme: scheme.id.clone(),
+                                        tasks,
+                                        desired: ids.clone(),
+                                        saved: ids,
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                        }
+                        for (id, entry) in entries.iter_mut() {
+                            entry.tasks = value
+                                .package_tasks
+                                .iter()
+                                .filter(|t| &t.task_group_id == id)
+                                .map(|t| t.id.clone())
+                                .collect();
+                            entry.tasks.sort();
+                        }
+                    }
+                    selection_ready.set(true);
                     if !value
                         .task_groups
                         .iter()
@@ -82,9 +173,13 @@ pub fn Package() -> Element {
             match api::get::<BuildStatusResponse>("/api/build/status").await {
                 Ok(value) => {
                     build_status.set(value);
+                    status_known.set(true);
                     poll_error.set(String::new());
                 }
-                Err(error) => poll_error.set(error),
+                Err(error) => {
+                    poll_error.set(error);
+                    status_known.set(false);
+                }
             }
             TimeoutFuture::new(2000).await;
         }
@@ -106,52 +201,107 @@ pub fn Package() -> Element {
             tasks
         })
         .unwrap_or_default();
-    let selected_count = selected_tasks().len();
+    let current_ids =
+        use_memo(move || selected_in_group(&settings(), &selected_tasks(), &selected_group()));
+    let selected_count = current_ids().len();
+    let all_ids = use_memo(move || ordered_selection(&settings(), &selected_tasks()));
+    let selection_locked = (ui.managing)() || (ui.saving)() || !saves.ready(&selected_group());
+    let blocked = if selection_locked {
+        "方案尚未就绪或正在编辑"
+    } else if !status_known() {
+        "状态尚未确认"
+    } else if !action_busy().is_empty() {
+        "提交中…"
+    } else if build_status().build_in_progress {
+        "全局队列占用"
+    } else if ui.dirty() {
+        "请先保存或放弃组参数修改"
+    } else {
+        ""
+    };
+    let global_dirty = ui.dirty()
+        && all_ids().iter().any(|id| {
+            settings()
+                .package_tasks
+                .iter()
+                .any(|task| &task.id == id && task.task_group_id == (ui.draft)().id)
+        });
+    let global_disabled = selection_locked
+        || all_ids().is_empty()
+        || !status_known()
+        || !action_busy().is_empty()
+        || build_status().build_in_progress
+        || global_dirty;
+    let active_task = settings()
+        .package_tasks
+        .into_iter()
+        .find(|task| Some(&task.id) == build_status().active_task_id.as_ref());
 
     rsx! {
         div { class: "page package-page",
             aside { class: "page__side package-tree",
                 div { class: "tree-head", strong { "任务组" } span { class: "spacer" } button { class: "btn btn--sm btn--icon", title: "新建任务组", disabled: settings().projects.is_empty(), onclick: move |_| { let project_id = settings().projects.first().map(|project| project.id.clone()).unwrap_or_default(); group_editor.set(Some((true, TaskGroup { project_id, branch: "main".to_owned(), ..TaskGroup::default() }))); }, Icon { width: 15, height: 15, icon: LdPlus } } }
-                if settings().projects.is_empty() { div { class: "empty-inline", "请先在设置页添加项目" } }
-                for project in settings().projects {
-                    ProjectGroups { project, groups: settings().task_groups, tasks: settings().package_tasks, statuses: build_status(), selected_group, on_new: move |project_id| group_editor.set(Some((true, TaskGroup { project_id, branch: "main".to_owned(), ..TaskGroup::default() }))) }
+                nav { class: "package-group-list", "aria-label": "任务组列表", tabindex: "0",
+                    if settings().projects.is_empty() { div { class: "empty-inline", "请先在设置页添加项目" } }
+                    for project in settings().projects {
+                        ProjectGroups { project, groups: settings().task_groups, tasks: settings().package_tasks, statuses: build_status(), selected_group, selections: selected_tasks(), on_new: move |project_id| group_editor.set(Some((true, TaskGroup { project_id, branch: "main".to_owned(), ..TaskGroup::default() }))) }
+                    }
+                }
+                section { class: "global-queue",
+                    strong { "全局构建队列" }
+                    div { class: "global-queue__details", role: "region", "aria-label": "全局队列详情", tabindex: "0",
+                        for group in settings().task_groups {
+                            { let count = selected_in_group(&settings(), &selected_tasks(), &group.id).len(); rsx! { if count > 0 { span { "{group.name}：已选 {count} 项" } } } }
+                        }
+                        if global_dirty { p { class: "field-error", "所选任务组有未保存参数" } }
+                        if !status_known() { p { class: "hint", "队列状态尚未确认，暂不能启动" } }
+                        if build_status().build_in_progress {
+                            span { if build_status().cancel_requested { "正在停止整个队列…" } else { "全局队列占用" } }
+                            if let Some(task) = &active_task { span { "{task.name} · {task.group}" } }
+                            span { "等待 {build_status().queued_task_ids.len()} 项" }
+                        }
+                    }
+                    span { "合计 {all_ids().len()} 项 · 串行执行" }
+                    button { class: "btn btn--primary", disabled: global_disabled, onclick: move |_| start_tasks(all_ids(), context, build_status, action_busy), if !action_busy().is_empty() { "提交中…" } else { "启动全部已选任务" } }
+                    button { class: "btn btn--sm", disabled: (ui.managing)() || (ui.saving)() || selected_tasks().is_empty(), onclick: move |_| selected_tasks.set(Vec::new()), "清空全部勾选" }
+                    if build_status().build_in_progress {
+                        if let Some(task) = active_task {
+                            button { class: "btn btn--sm", onclick: { let id = task.task_group_id.clone(); move |_| ui.select_group(id.clone()) }, "查看运行组" }
+                            button { class: "btn btn--sm btn--danger", disabled: build_status().cancel_requested || !action_busy().is_empty(), onclick: move |_| stop_target.set(Some(task.id.clone())), "停止整个队列" }
+                        }
+                    }
                 }
             }
-            main { class: "page__main package-main",
-                div { class: "toolbar",
-                    div { h1 { "打包任务" } p { class: "toolbar__subtitle", if let Some(group) = &current_group { "{group.name} · {current_tasks.len()} 个任务" } else { "选择或创建任务组" } } }
-                    if !poll_error().is_empty() { span { class: "tag tag--err", title: "{poll_error}", "状态连接中断" } }
-                    span { class: "spacer" }
-                    button { class: "btn btn--icon", title: "刷新配置", disabled: loading(), onclick: move |_| refresh += 1, Icon { width: 16, height: 16, icon: LdRefreshCw } }
-                    button { class: "btn btn--primary", disabled: current_group.is_none(), onclick: move |_| if let Some(group) = current_group.clone() { task_editor.set(Some((true, PackageTask { task_group_id: group.id, group: group.name, build_args_json: "{}".to_owned(), dead_code_injection_count: 200, ..PackageTask::default() }))); }, Icon { width: 15, height: 15, icon: LdPlus } "新建任务" }
-                }
+            main { class: "page__main package-main", "aria-label": "打包任务内容", tabindex: "0",
                 if loading() && settings().task_groups.is_empty() { div { class: "empty-state", "正在加载打包配置…" } }
                 else if !load_error().is_empty() { div { class: "error-state", p { "{load_error}" } button { class: "btn", onclick: move |_| refresh += 1, "重试" } } }
                 else if let Some(group) = current_group.clone() {
-                    GroupDetail { key: "{group.id}", group: group.clone(), project: settings().projects.into_iter().find(|project| project.id == group.project_id), definitions: settings().param_definitions, on_edit: move |group| group_editor.set(Some((false, group))), on_delete: move |group| delete_group.set(Some(group)), on_saved: move |_| refresh += 1 }
-                    if selected_count > 0 {
-                        div { class: "batch-bar",
-                            strong { "已选择 {selected_count} 项" }
-                            button { class: "btn btn--sm btn--primary", onclick: move |_| start_tasks(selected_tasks(), context, build_status), Icon { width: 14, height: 14, icon: LdPlay } "启动" }
-                            button { class: "btn btn--sm", disabled: preps().is_empty(), onclick: move |_| { batch_prep_result.set(None); if let Some(prep) = preps().first() { batch_prep_id.set(prep.id.clone()); batch_prep_values.set(default_prep_values(prep)); } batch_prep_open.set(true); }, Icon { width: 14, height: 14, icon: LdHammer } "执行准备项目" }
-                            button { class: "btn btn--sm btn--danger", onclick: move |_| confirm_batch_delete.set(true), Icon { width: 14, height: 14, icon: LdTrash2 } "删除" }
+                    GroupDetail { task_ids: current_tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>(), queue_busy: !status_known() || build_status().build_in_progress, key: "{group.id}", group: group.clone(), project: settings().projects.into_iter().find(|project| project.id == group.project_id), definitions: settings().param_definitions, on_edit: move |group| group_editor.set(Some((false, group))), on_delete: move |group| delete_group.set(Some(group)), on_saved: move |_| refresh += 1 }
+                    div { class: if selected_count == 0 { "batch-bar is-empty" } else { "batch-bar" },
+                            strong { "本组已选 {selected_count} 项" }
+                            button { class: "btn btn--sm btn--primary", disabled: selected_count == 0 || !blocked.is_empty(), title: blocked, onclick: move |_| start_tasks(current_ids(), context, build_status, action_busy), Icon { width: 14, height: 14, icon: LdPlay } "启动本组已选" }
+                            button { class: "btn btn--sm", disabled: selected_count == 0 || preps().is_empty() || !blocked.is_empty(), onclick: move |_| { batch_prep_result.set(None); if let Some(prep) = preps().first() { batch_prep_id.set(prep.id.clone()); batch_prep_values.set(default_prep_values(prep)); } batch_prep_open.set(true); }, Icon { width: 14, height: 14, icon: LdHammer } "执行准备项目" }
+                            button { class: "btn btn--sm btn--danger", disabled: selected_count == 0 || build_status().build_in_progress, onclick: move |_| confirm_batch_delete.set(true), Icon { width: 14, height: 14, icon: LdTrash2 } "删除" }
+                            if !poll_error().is_empty() { span { class: "tag tag--err", title: "{poll_error}", "状态连接中断" } }
                             span { class: "spacer" }
-                            button { class: "btn btn--sm", onclick: move |_| selected_tasks.set(Vec::new()), "取消选择" }
-                        }
+                            button { class: "btn btn--sm", disabled: selection_locked || selected_count == 0, onclick: move |_| { let ids = current_ids(); selected_tasks.write().retain(|id| !ids.contains(id)); }, "清空本组勾选" }
+                            button { class: "btn btn--sm btn--icon", title: "刷新配置", "aria-label": "刷新配置", disabled: loading(), onclick: move |_| refresh += 1, Icon { width: 16, height: 16, icon: LdRefreshCw } }
+                            button { class: "btn btn--sm btn--primary", onclick: move |_| { task_editor.set(Some((true, PackageTask { task_group_id: group.id.clone(), group: group.name.clone(), build_args_json: "{}".to_owned(), dead_code_injection_count: 200, ..PackageTask::default() }))); }, Icon { width: 15, height: 15, icon: LdPlus } "新建任务" }
                     }
-                    TaskTable { tasks: current_tasks, statuses: build_status, selected: selected_tasks, busy: action_busy(), on_edit: move |task| task_editor.set(Some((false, task))), on_delete: move |task| delete_task.set(Some(task)), on_cleanup: move |task| cleanup_task.set(Some(task)), on_refresh: move |_| refresh += 1 }
-                } else { div { class: "empty-state", strong { "还没有任务组" } p { "先在左侧为项目创建任务组，再添加打包任务。" } } }
+                    TaskTable { selection_locked, tasks: current_tasks, statuses: build_status, selected: selected_tasks, busy: blocked.to_owned(), submitting: action_busy, on_stop: move |id| stop_target.set(Some(id)), on_edit: move |task| task_editor.set(Some((false, task))), on_delete: move |task| delete_task.set(Some(task)), on_cleanup: move |task| cleanup_task.set(Some(task)), on_refresh: move |_| refresh += 1 }
+                } else { div { class: "empty-state", strong { "还没有任务组" } p { "先在左侧为项目创建任务组，再添加打包任务。" } button { class: "btn btn--sm", disabled: loading(), onclick: move |_| refresh += 1, Icon { width: 16, height: 16, icon: LdRefreshCw } "刷新配置" } } }
             }
         }
 
-        if let Some((is_new, group)) = group_editor() { GroupEditor { is_new, value: group, projects: settings().projects, groups: settings().task_groups, definitions: settings().param_definitions, on_cancel: move |_| group_editor.set(None), on_saved: move |group: TaskGroup| { selected_group.set(group.id); group_editor.set(None); refresh += 1; } } }
+        if let Some((is_new, group)) = group_editor() { GroupEditor { is_new, value: group, projects: settings().projects, groups: settings().task_groups, definitions: settings().param_definitions, on_cancel: move |_| group_editor.set(None), on_saved: move |group: TaskGroup| { ui.select_group(group.id); group_editor.set(None); refresh += 1; } } }
         if let Some((is_new, task)) = task_editor() { TaskEditor { is_new, value: task, groups: settings().task_groups, preps: preps(), dark: (context.dark)(), on_cancel: move |_| task_editor.set(None), on_saved: move |_| { task_editor.set(None); refresh += 1; } } }
 
-        if let Some(group) = delete_group() { ConfirmDialog { title: "删除任务组".to_owned(), message: format!("确认删除「{}」及组内 {} 个任务？任务目录也会被清理。", group.name, settings().package_tasks.iter().filter(|task| task.task_group_id == group.id).count()), confirm_label: "删除任务组".to_owned(), danger: true, on_cancel: move |_| delete_group.set(None), on_confirm: move |_| { let id = group.id.clone(); delete_group.set(None); spawn(async move { match api::delete(&format!("/api/task-groups/{id}")).await { Ok(()) => { selected_group.set(String::new()); selected_tasks.set(Vec::new()); context.success("任务组已删除"); refresh += 1; }, Err(error) => context.error(error) } }); } } }
+        if let Some(group) = delete_group() { ConfirmDialog { title: "删除任务组".to_owned(), message: format!("确认删除「{}」及组内 {} 个任务？任务目录也会被清理。", group.name, settings().package_tasks.iter().filter(|task| task.task_group_id == group.id).count()), confirm_label: "删除任务组".to_owned(), danger: true, on_cancel: move |_| delete_group.set(None), on_confirm: move |_| { let id = group.id.clone(); delete_group.set(None); spawn(async move { match api::delete(&format!("/api/task-groups/{id}")).await { Ok(()) => { selected_group.set(String::new()); ui.draft.set(TaskGroup::default()); ui.baseline.set(TaskGroup::default()); context.success("任务组已删除"); refresh += 1; }, Err(error) => context.error(error) } }); } } }
         if let Some(task) = delete_task() { ConfirmDialog { title: "删除任务".to_owned(), message: format!("确认删除「{}」及其本地任务目录？", task.name), confirm_label: "删除任务".to_owned(), danger: true, on_cancel: move |_| delete_task.set(None), on_confirm: move |_| { let id = task.id.clone(); delete_task.set(None); spawn(async move { match api::delete(&format!("/api/package-tasks/{id}")).await { Ok(()) => { selected_tasks.write().retain(|task_id| task_id != &id); context.success("任务已删除"); refresh += 1; }, Err(error) => context.error(error) } }); } } }
-        if confirm_batch_delete() { ConfirmDialog { title: "批量删除任务".to_owned(), message: format!("确认删除已选择的 {selected_count} 个任务及其任务目录？"), confirm_label: "全部删除".to_owned(), danger: true, on_cancel: move |_| confirm_batch_delete.set(false), on_confirm: move |_| { let ids = selected_tasks(); confirm_batch_delete.set(false); spawn(async move { for id in &ids { if let Err(error) = api::delete(&format!("/api/package-tasks/{id}")).await { context.error(error); return; } } selected_tasks.set(Vec::new()); context.success("已删除所选任务"); refresh += 1; }); } } }
+        if confirm_batch_delete() { ConfirmDialog { title: "批量删除任务".to_owned(), message: format!("确认删除本组 {selected_count} 个任务及其任务目录？\n{}", settings().package_tasks.iter().filter(|task| current_ids().contains(&task.id)).map(|task| task.name.clone()).collect::<Vec<_>>().join("、")), confirm_label: "全部删除".to_owned(), danger: true, on_cancel: move |_| confirm_batch_delete.set(false), on_confirm: move |_| { let ids = current_ids(); confirm_batch_delete.set(false); spawn(async move { for id in &ids { if let Err(error) = api::delete(&format!("/api/package-tasks/{id}")).await { context.error(error); return; } } selected_tasks.write().retain(|id| !ids.contains(id)); context.success("已删除所选任务"); refresh += 1; }); } } }
         if let Some(task) = cleanup_task() { ConfirmDialog { title: "清理任务私有仓库".to_owned(), message: format!("确认丢弃「{}」代码包和资源包仓库内的全部本地改动？", task.name), confirm_label: "清理全部改动".to_owned(), danger: true, on_cancel: move |_| cleanup_task.set(None), on_confirm: move |_| { let id = task.id.clone(); cleanup_task.set(None); spawn(async move { match api::post::<Value, _>(&format!("/api/package-tasks/{id}/cleanup-private-repos"), &json!({})).await { Ok(_) => context.success("任务私有仓库已清理"), Err(error) => context.error(error) } }); } } }
-        if batch_prep_open() { BatchPrepDialog { preps: preps(), selected_tasks: selected_tasks(), prep_id: batch_prep_id, values: batch_prep_values, result: batch_prep_result, on_close: move |_| batch_prep_open.set(false) } }
+        if let Some(id) = stop_target() { ConfirmDialog { title: "停止整个构建队列".to_owned(), message: "将停止当前任务，并取消队列中所有后续任务。".to_owned(), confirm_label: "停止整个队列".to_owned(), danger: true, on_cancel: move |_| stop_target.set(None), on_confirm: move |_| { stop_target.set(None); stop_task(id.clone(), context, build_status, action_busy); } } }
+        if batch_prep_open() { BatchPrepDialog { preps: preps(), selected_tasks: current_ids(), prep_id: batch_prep_id, values: batch_prep_values, result: batch_prep_result, on_close: move |_| batch_prep_open.set(false) } }
     }
 }
 
@@ -162,8 +312,10 @@ fn ProjectGroups(
     tasks: Vec<PackageTask>,
     statuses: BuildStatusResponse,
     selected_group: Signal<String>,
+    selections: Vec<String>,
     on_new: EventHandler<String>,
 ) -> Element {
+    let ui = use_context::<PackageUi>();
     let mut project_groups = groups
         .into_iter()
         .filter(|group| group.project_id == project.id)
@@ -174,11 +326,11 @@ fn ProjectGroups(
             div { class: "tree-project__head", span { "{project.name}" } span { class: "spacer" } button { class: "btn btn--ghost btn--icon", title: "为项目新建任务组", onclick: move |_| on_new.call(project.id.clone()), Icon { width: 14, height: 14, icon: LdPlus } } }
             if project_groups.is_empty() { p { class: "tree-empty", "暂无任务组" } }
             for group in project_groups {
-                { let group_tasks = tasks.iter().filter(|task| task.task_group_id == group.id).collect::<Vec<_>>(); let running = group_tasks.iter().any(|task| task_runtime(task, &statuses).0 == TaskStatus::Running); rsx! {
-                    button { class: if selected_group() == group.id { "tree__group is-active" } else { "tree__group" }, onclick: move |_| selected_group.set(group.id.clone()),
+                { let group_tasks = tasks.iter().filter(|task| task.task_group_id == group.id).collect::<Vec<_>>(); let running = group_tasks.iter().any(|task| matches!(task_runtime(task, &statuses).0, TaskStatus::Running | TaskStatus::Canceling)); rsx! {
+                    button { class: if selected_group() == group.id { "tree__group is-active" } else { "tree__group" }, onclick: move |_| ui.select_group(group.id.clone()),
                         span { class: if running { "status-dot status-dot--run" } else { "status-dot" } }
                         span { class: "tree__group-name", "{group.name}" }
-                        span { class: "tag tag--mono", "{group_tasks.len()}" }
+                        span { class: "tag tag--mono", "{group_tasks.iter().filter(|task| selections.contains(&task.id)).count()}/{group_tasks.len()} 已选" }
                     }
                 } }
             }
@@ -189,6 +341,8 @@ fn ProjectGroups(
 #[component]
 fn GroupDetail(
     group: TaskGroup,
+    task_ids: Vec<String>,
+    queue_busy: bool,
     project: Option<Project>,
     definitions: Vec<ParamDefinition>,
     on_edit: EventHandler<TaskGroup>,
@@ -196,31 +350,34 @@ fn GroupDetail(
     on_saved: EventHandler<MouseEvent>,
 ) -> Element {
     let context = use_context::<AppContext>();
-    let mut draft = use_signal(|| group.clone());
-    let mut saving = use_signal(|| false);
-    let mut branches = use_signal(Vec::<String>::new);
-    let mut branch_loading = use_signal(|| false);
+    let mut ui = use_context::<PackageUi>();
+    let mut draft = ui.draft;
+    let saving = ui.saving;
+    let saves = use_context::<crate::schemes::SchemeSaves>();
+    let editing_disabled = saving() || (ui.managing)() || queue_busy || !saves.ready(&group.id);
+    use_hook({
+        let group = group.clone();
+        move || {
+            ui.draft.set(group.clone());
+            ui.baseline.set(group);
+        }
+    });
+    use_effect(use_reactive((&group,), move |(group,)| {
+        let clean = {
+            let a = ui.draft.peek();
+            let b = ui.baseline.peek();
+            a.branch == b.branch && a.params == b.params
+        };
+        if clean && !*ui.saving.peek() {
+            ui.draft.set(group.clone());
+            ui.baseline.set(group);
+        }
+    }));
     let mut config_open = use_signal(|| false);
-    let branch_project_id = group.project_id.clone();
     let project_name = project
         .as_ref()
         .map(|project| project.name.as_str())
         .unwrap_or("未知项目");
-    let load_branches = move |_| {
-        let project_id = branch_project_id.clone();
-        spawn(async move {
-            branch_loading.set(true);
-            let path = format!(
-                "/api/project-branches?projectId={}",
-                api::encode_query(&project_id)
-            );
-            match api::get::<ProjectBranchesResponse>(&path).await {
-                Ok(value) => branches.set(value.branches),
-                Err(error) => context.error(error),
-            }
-            branch_loading.set(false);
-        });
-    };
     let visible_definitions = definitions
         .iter()
         .filter(|definition| !group.hidden_params.iter().any(|key| key == &definition.key))
@@ -234,41 +391,37 @@ fn GroupDetail(
         section { class: "group-detail",
             div { class: "group-detail__head",
                 div { h2 { "{group.name}" } p { class: "hint", "{project_name}" if !group.description.is_empty() { " · {group.description}" } } }
+                crate::schemes::Schemes { task_ids, queue_busy }
                 span { class: "spacer" }
-                button { class: "btn btn--sm", onclick: move |_| on_edit.call(edit_group.clone()), Icon { width: 14, height: 14, icon: LdPencil } "编辑组" }
-                button { class: "btn btn--sm btn--danger btn--icon", title: "删除任务组", onclick: move |_| on_delete.call(delete_group.clone()), Icon { width: 14, height: 14, icon: LdTrash2 } }
+                button { class: "btn btn--sm", disabled: (ui.managing)() || ui.dirty() || saving(), title: "修改组信息前请先保存或放弃组参数", onclick: move |_| on_edit.call(edit_group.clone()), Icon { width: 14, height: 14, icon: LdPencil } "编辑组" }
+                button { class: "btn btn--sm btn--danger btn--icon", title: "删除任务组", disabled: (ui.managing)() || saving(), onclick: move |_| on_delete.call(delete_group.clone()), Icon { width: 14, height: 14, icon: LdTrash2 } }
             }
-            div { class: "group-detail__form",
-                div { class: "field field--span-all", label { class: "field__label", "Git 分支" }
-                    div { class: "input-action", if branches().is_empty() { input { class: "input input--mono", value: "{draft().branch}", oninput: move |event| draft.write().branch = event.value() } } else { select { class: "select select--mono", value: "{draft().branch}", onchange: move |event| draft.write().branch = event.value(), for branch in branches() { option { value: "{branch}", "{branch}" } } } } button { class: "btn btn--icon", title: "拉取远程分支", disabled: branch_loading(), onclick: load_branches, Icon { width: 15, height: 15, icon: LdGitBranch } } }
-                }
+            fieldset { class: "group-detail__form", disabled: editing_disabled,
+                BranchPicker { project: project.clone(), value: draft().branch, disabled: saving(), on_change: move |value| draft.write().branch = value }
                 for definition in visible_definitions { GroupParamField { definition, draft } }
                 if hidden_count > 0 { p { class: "hint group-detail__hidden-hint", "已隐藏 {hidden_count} 个参数，值保留并参与构建；可在参数配置中调整。" } }
-                div { class: "group-detail__save", button { class: "btn btn--primary", disabled: saving() || draft().branch.trim().is_empty(), onclick: move |event| { let id = draft().id; let request = TaskGroupParamsRequest { branch: draft().branch, params: draft().params }; spawn(async move { saving.set(true); match api::put::<TaskGroup, _>(&format!("/api/task-groups/{id}/params"), &request).await { Ok(_) => { context.success("任务组参数已保存"); on_saved.call(event); }, Err(error) => context.error(error) } saving.set(false); }); }, Icon { width: 15, height: 15, icon: LdSave } if saving() { "保存中…" } else { "保存组参数" } } }
             }
             div { class: "group-detail__presets",
                 div { class: "preset-head",
                     strong { "参数预设" }
-                    span { class: "hint", "点击即切换并保存组参数" }
                     span { class: "spacer" }
-                    button { class: "btn btn--sm", onclick: move |_| config_open.set(true), Icon { width: 14, height: 14, icon: LdSettings } "参数配置" }
+                    button { class: "btn btn--sm", disabled: editing_disabled || ui.dirty(), onclick: move |_| config_open.set(true), Icon { width: 14, height: 14, icon: LdSettings } "参数配置" }
                 }
-                if group.presets.is_empty() { p { class: "hint", "暂无预设；打开参数配置添加一键切换。" } }
                 div { class: "preset-list",
                     for preset in group.presets.iter().cloned() {
-                        { let is_applied = !preset.params.is_empty() && preset.params.iter().all(|(key, value)| draft().params.get(key) == Some(value)); rsx! {
-                            button { class: if is_applied { "preset-chip is-applied" } else { "preset-chip" }, title: "点击切换为「{preset.name}」", onclick: { let preset = preset.clone(); move |event| {
-                                let id = draft().id;
-                                let branch = draft().branch;
-                                let mut params = draft().params.clone();
-                                for (key, value) in &preset.params { params.insert(key.clone(), value.clone()); }
-                                draft.write().params = params.clone();
-                                let request = TaskGroupParamsRequest { branch, params };
+                        { let is_applied = !ui.dirty() && !preset.params.is_empty() && preset.params.iter().all(|(key, value)| draft().params.get(key) == Some(value)); rsx! {
+                            button { class: if is_applied { "preset-chip is-applied" } else { "preset-chip" }, title: "点击切换为「{preset.name}」", disabled: editing_disabled || ui.dirty(), onclick: { let preset = preset.clone(); move |event| {
+                                for (key, value) in &preset.params { draft.write().params.insert(key.clone(), value.clone()); }
                                 let name = preset.name.clone();
-                                spawn(async move { match api::put::<TaskGroup, _>(&format!("/api/task-groups/{id}/params"), &request).await { Ok(_) => { context.success(format!("已切换为「{name}」")); on_saved.call(event); }, Err(error) => context.error(error) } });
+                                spawn(async move { match ui.save().await { Ok(()) => { context.success(format!("已切换为「{name}」")); on_saved.call(event); }, Err(error) => context.error(error) } });
                             } }, if is_applied { span { class: "preset-chip__check" } } "{preset.name}" }
                         } }
                     }
+                }
+            div { class: "group-detail__save",
+                    if ui.dirty() { span { class: "tag tag--err", "未保存" } }
+                    button { class: "btn", disabled: editing_disabled || !ui.dirty(), onclick: move |_| draft.set((ui.baseline)()), "放弃修改" }
+                    button { class: "btn btn--primary", disabled: editing_disabled || draft().branch.trim().is_empty() || !ui.dirty(), onclick: move |event| { spawn(async move { match ui.save().await { Ok(()) => { context.success("任务组参数已保存"); on_saved.call(event); }, Err(error) => context.error(error) } }); }, if saving() { "保存中…" } else { "保存参数" } }
                 }
             }
         }
@@ -287,6 +440,7 @@ fn GroupConfigDialog(
     on_saved: EventHandler<MouseEvent>,
 ) -> Element {
     let context = use_context::<AppContext>();
+    let mut ui = use_context::<PackageUi>();
     let mut presets = use_signal(|| group.presets.clone());
     let mut hidden = use_signal(|| group.hidden_params.clone());
     let mut saving = use_signal(|| false);
@@ -328,8 +482,8 @@ fn GroupConfigDialog(
                         project_id: draft().project_id,
                         name: draft().name,
                         description: draft().description,
-                        branch: draft().branch,
-                        params: draft().params,
+                        branch: (ui.baseline)().branch,
+                        params: (ui.baseline)().params,
                         copy_from_group_id: None,
                         presets: Some(presets()),
                         hidden_params: Some(hidden()),
@@ -337,7 +491,7 @@ fn GroupConfigDialog(
                     spawn(async move {
                         saving.set(true);
                         match api::put::<TaskGroup, _>(&format!("/api/task-groups/{id}"), &request).await {
-                            Ok(_) => { context.success("参数配置已保存"); on_saved.call(event); },
+                            Ok(group) => { ui.baseline.set(group.clone()); ui.draft.set(group); context.success("参数配置已保存"); on_saved.call(event); },
                             Err(error) => context.error(error),
                         }
                         saving.set(false);
@@ -367,7 +521,7 @@ fn PresetParamField(
             label { class: "field__label", "{definition.label}" span { class: "tag tag--mono", "{definition.key}" } }
             if !included { p { class: "hint", "未参与此预设，切换时保持当前值" } }
             else if definition.kind == ParamKind::Switch { label { class: "switch", input { r#type: "checkbox", checked: value.as_bool().unwrap_or(false), onchange: { let definition = definition.clone(); move |event| { presets.write()[index].params.insert(definition.key.clone(), Value::Bool(event.checked())); } } } i {} } }
-            else if definition.kind == ParamKind::Select { select { class: "select", value: "{rendered}", onchange: { let definition = definition.clone(); move |event| { presets.write()[index].params.insert(definition.key.clone(), Value::String(event.value())); } }, for option in definition.options.iter() { option { key: "{option}", value: "{option}", selected: option == &rendered, "{option}" } } } }
+            else if definition.kind == ParamKind::Select || (definition.kind == ParamKind::Identifier && !definition.options.is_empty()) { select { class: "select", value: "{rendered}", onchange: { let definition = definition.clone(); move |event| { presets.write()[index].params.insert(definition.key.clone(), Value::String(event.value())); } }, for option in definition.options.iter() { option { key: "{option}", value: "{option}", selected: option == &rendered, "{option}" } } } }
             else { input { class: "input input--mono", value: "{rendered}", oninput: { let definition = definition.clone(); move |event| { let value = if definition.kind == ParamKind::Number { parse_number_value(&event.value()) } else { Value::String(event.value()) }; presets.write()[index].params.insert(definition.key.clone(), value); } } } }
         }
     } }
@@ -381,20 +535,49 @@ fn GroupParamField(definition: ParamDefinition, draft: Signal<TaskGroup>) -> Ele
         .cloned()
         .unwrap_or(definition.default_value.clone());
     let rendered = value_text(&value);
-    rsx! { div { class: "field", label { class: "field__label", "{definition.label}" span { class: "tag tag--mono", "{definition.key}" } }
+    let version_key = definition.key.clone();
+    let version_prefix = rendered
+        .rsplit_once('.')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or("")
+        .to_owned();
+    let help = format!(
+        "{}{}{}{}",
+        definition.kind.label(),
+        if definition.required {
+            " · 必填"
+        } else {
+            " · 可选"
+        },
+        match definition.kind {
+            ParamKind::Version => format!(
+                "\n至少两段数字，以点分隔；保留前导零。\n{version_key}_prefix：{version_prefix}"
+            ),
+            ParamKind::Identifier => "\n只允许英文字母和下划线；保存时自动转为小写。".into(),
+            _ => String::new(),
+        },
+        if definition.description.is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", definition.description)
+        }
+    );
+    rsx! { div { class: if definition.kind == ParamKind::Switch { "field field--switch" } else { "field" }, div { class: "field__label", "{definition.label}" span { class: "tag tag--mono", "{definition.key}" } crate::package_ui::FieldHelp { id: format!("param-help-{}", definition.key), text: help } }
         if definition.kind == ParamKind::Switch { label { class: "switch", input { r#type: "checkbox", checked: value.as_bool().unwrap_or(false), onchange: move |event| { draft.write().params.insert(definition.key.clone(), Value::Bool(event.checked())); } } i {} } }
-        else if definition.kind == ParamKind::Select { select { class: "select", value: "{rendered}", onchange: move |event| { draft.write().params.insert(definition.key.clone(), Value::String(event.value())); }, for option in definition.options { option { key: "{option}", value: "{option}", selected: option == rendered, "{option}" } } } }
+        else if definition.kind == ParamKind::Select || (definition.kind == ParamKind::Identifier && !definition.options.is_empty()) { select { class: "select", value: "{rendered}", onchange: move |event| { draft.write().params.insert(definition.key.clone(), Value::String(event.value())); }, for option in definition.options { option { key: "{option}", value: "{option}", selected: option == rendered, "{option}" } } } }
         else { input { class: "input input--mono", value: "{rendered}", oninput: move |event| { let value = if definition.kind == ParamKind::Number { parse_number_value(&event.value()) } else { Value::String(event.value()) }; draft.write().params.insert(definition.key.clone(), value); } } }
-        if !definition.description.is_empty() { p { class: "hint", "{definition.description}" } }
     } }
 }
 
 #[component]
 fn TaskTable(
+    selection_locked: bool,
     tasks: Vec<PackageTask>,
     statuses: Signal<BuildStatusResponse>,
     selected: Signal<Vec<String>>,
     busy: String,
+    submitting: Signal<String>,
+    on_stop: EventHandler<String>,
     on_edit: EventHandler<PackageTask>,
     on_delete: EventHandler<PackageTask>,
     on_cleanup: EventHandler<PackageTask>,
@@ -404,11 +587,12 @@ fn TaskTable(
         return rsx! { div { class: "empty-state empty-state--tasks", "这个任务组还没有打包任务" } };
     }
     let group_id = tasks[0].task_group_id.clone();
-    rsx! { section { class: "table-panel task-table", div { class: "table-scroll", table { class: "table", thead { tr { th { class: "check-cell", input { r#type: "checkbox", checked: !tasks.is_empty() && tasks.iter().all(|task| selected().contains(&task.id)), onchange: move |event| { if event.checked() { selected.set(tasks.iter().map(|task| task.id.clone()).collect()); } else { selected.set(Vec::new()); } } } } th { "任务" } th { "状态" } th { "进度" } th { class: "table__actions-head", "操作" } } } tbody { for (index, task) in tasks.iter().cloned().enumerate() { TaskRow { index, total: tasks.len(), task, all_tasks: tasks.clone(), statuses, selected, busy: busy.clone(), group_id: group_id.clone(), on_edit, on_delete, on_cleanup, on_refresh } } } } } } }
+    rsx! { section { class: "table-panel task-table", div { class: "table-scroll", table { class: "table", thead { tr { th { class: "check-cell", input { r#type: "checkbox", disabled: selection_locked, checked: !tasks.is_empty() && tasks.iter().all(|task| selected().contains(&task.id)), onchange: move |event| { if event.checked() { for task in &tasks { if !selected().contains(&task.id) { selected.write().push(task.id.clone()); } } } else { selected.write().retain(|id| !tasks.iter().any(|task| &task.id == id)); } } } } th { "任务" } th { "状态" } th { "进度" } th { class: "table__actions-head", "操作" } } } tbody { for (index, task) in tasks.iter().cloned().enumerate() { TaskRow { selection_locked, index, total: tasks.len(), task, all_tasks: tasks.clone(), statuses, selected, busy: busy.clone(), submitting, on_stop, group_id: group_id.clone(), on_edit, on_delete, on_cleanup, on_refresh } } } } } } }
 }
 
 #[component]
 fn TaskRow(
+    selection_locked: bool,
     index: usize,
     total: usize,
     task: PackageTask,
@@ -416,6 +600,8 @@ fn TaskRow(
     statuses: Signal<BuildStatusResponse>,
     selected: Signal<Vec<String>>,
     busy: String,
+    submitting: Signal<String>,
+    on_stop: EventHandler<String>,
     group_id: String,
     on_edit: EventHandler<PackageTask>,
     on_delete: EventHandler<PackageTask>,
@@ -425,22 +611,23 @@ fn TaskRow(
     let context = use_context::<AppContext>();
     let (status, progress, step, error) = task_runtime(&task, &statuses());
     let running = status == TaskStatus::Running || status == TaskStatus::Canceling;
+    let queued = statuses().queued_task_ids.contains(&task.id);
     let selection_task_id = task.id.clone();
     rsx! { tr { key: "{task.id}",
-        td { class: "check-cell", input { r#type: "checkbox", checked: selected().contains(&task.id), onchange: move |event| { if event.checked() { if !selected().contains(&selection_task_id) { selected.write().push(selection_task_id.clone()); } } else { selected.write().retain(|id| id != &selection_task_id); } } } }
+        td { class: "check-cell", input { r#type: "checkbox", disabled: selection_locked, checked: selected().contains(&task.id), onchange: move |event| { if event.checked() { if !selected().contains(&selection_task_id) { selected.write().push(selection_task_id.clone()); } } else { selected.write().retain(|id| id != &selection_task_id); } } } }
         td { strong { "{task.name}" } if !error.is_empty() { p { class: "task-error", "{error}" } } }
-        td { span { class: "tag {status.class()}", "{status.label()}" } }
+        td { span { class: "tag {status.class()}", if statuses().queued_task_ids.contains(&task.id) { "排队中" } else { "{status.label()}" } } }
         td { div { class: "progress-cell", div { class: "progress", div { style: "width:{progress}%" } } span { class: "progress__label", if step.is_empty() { "{progress}%" } else { "{step} · {progress}%" } } } }
         td { div { class: "table__actions",
-            if task.enable_obfuscation { button { class: "btn btn--sm btn--icon", title: "单独执行混淆", disabled: running || busy == task.id, onclick: { let id = task.id.clone(); move |_| run_obfuscation(id.clone(), context) }, Icon { width: 14, height: 14, icon: LdSparkles } } }
-            if running { button { class: "btn btn--sm", disabled: status == TaskStatus::Canceling, onclick: { let id = task.id.clone(); move |_| stop_task(id.clone(), context) }, Icon { width: 14, height: 14, icon: LdCircleStop } "停止" } }
-            else { button { class: "btn btn--sm btn--primary", onclick: { let id = task.id.clone(); move |_| start_tasks(vec![id.clone()], context, statuses) }, Icon { width: 14, height: 14, icon: LdPlay } "启动" } }
-            button { class: "btn btn--sm btn--icon", title: "上移", disabled: index == 0 || running, onclick: { let task_id = task.id.clone(); let tasks = all_tasks.clone(); let group_id = group_id.clone(); move |event| reorder_task(tasks.clone(), &task_id, -1, group_id.clone(), on_refresh, event, context) }, Icon { width: 14, height: 14, icon: LdChevronUp } }
-            button { class: "btn btn--sm btn--icon", title: "下移", disabled: index + 1 == total || running, onclick: { let task_id = task.id.clone(); let tasks = all_tasks.clone(); let group_id = group_id.clone(); move |event| reorder_task(tasks.clone(), &task_id, 1, group_id.clone(), on_refresh, event, context) }, Icon { width: 14, height: 14, icon: LdChevronDown } }
-            button { class: "btn btn--sm btn--icon", title: "复制", disabled: running, onclick: { let id = task.id.clone(); move |event| duplicate_task(id.clone(), on_refresh, event, context) }, Icon { width: 14, height: 14, icon: LdCopy } }
-            button { class: "btn btn--sm btn--icon", title: "编辑", disabled: running, onclick: { let task = task.clone(); move |_| on_edit.call(task.clone()) }, Icon { width: 14, height: 14, icon: LdPencil } }
-            button { class: "btn btn--sm", disabled: running, onclick: { let task = task.clone(); move |_| on_cleanup.call(task.clone()) }, "清理仓库" }
-            button { class: "btn btn--sm btn--danger btn--icon", title: "删除", disabled: running, onclick: move |_| on_delete.call(task.clone()), Icon { width: 14, height: 14, icon: LdTrash2 } }
+            if task.enable_obfuscation { button { class: "btn btn--sm btn--icon", title: "单独执行混淆", disabled: running || !busy.is_empty(), onclick: { let id = task.id.clone(); move |_| run_obfuscation(id.clone(), context, statuses, submitting) }, Icon { width: 14, height: 14, icon: LdSparkles } } }
+            if running { button { class: "btn btn--sm", disabled: status == TaskStatus::Canceling || !submitting().is_empty(), onclick: { let id = task.id.clone(); move |_| on_stop.call(id.clone()) }, Icon { width: 14, height: 14, icon: LdCircleStop } "停止整个队列" } }
+            else { button { class: "btn btn--sm btn--primary", disabled: !busy.is_empty(), title: "{busy}", onclick: { let id = task.id.clone(); move |_| start_tasks(vec![id.clone()], context, statuses, submitting) }, Icon { width: 14, height: 14, icon: LdPlay } "启动" } }
+            button { class: "btn btn--sm btn--icon", title: "上移", disabled: index == 0 || running || queued, onclick: { let task_id = task.id.clone(); let tasks = all_tasks.clone(); let group_id = group_id.clone(); move |event| reorder_task(tasks.clone(), &task_id, -1, group_id.clone(), on_refresh, event, context) }, Icon { width: 14, height: 14, icon: LdChevronUp } }
+            button { class: "btn btn--sm btn--icon", title: "下移", disabled: index + 1 == total || running || queued, onclick: { let task_id = task.id.clone(); let tasks = all_tasks.clone(); let group_id = group_id.clone(); move |event| reorder_task(tasks.clone(), &task_id, 1, group_id.clone(), on_refresh, event, context) }, Icon { width: 14, height: 14, icon: LdChevronDown } }
+            button { class: "btn btn--sm btn--icon", title: "复制", disabled: running || queued, onclick: { let id = task.id.clone(); move |event| duplicate_task(id.clone(), on_refresh, event, context) }, Icon { width: 14, height: 14, icon: LdCopy } }
+            button { class: "btn btn--sm btn--icon", title: "编辑", disabled: running || queued, onclick: { let task = task.clone(); move |_| on_edit.call(task.clone()) }, Icon { width: 14, height: 14, icon: LdPencil } }
+            button { class: "btn btn--sm", disabled: running || queued, onclick: { let task = task.clone(); move |_| on_cleanup.call(task.clone()) }, "清理仓库" }
+            button { class: "btn btn--sm btn--danger btn--icon", title: "删除", disabled: running || queued, onclick: move |_| on_delete.call(task.clone()), Icon { width: 14, height: 14, icon: LdTrash2 } }
         } }
     } }
 }
@@ -459,39 +646,16 @@ fn GroupEditor(
     let id = value.id.clone();
     let mut draft = use_signal(|| value);
     let mut copy_from = use_signal(String::new);
-    let mut branches = use_signal(Vec::<String>::new);
-    let mut loading_branches = use_signal(|| false);
     let mut saving = use_signal(|| false);
-    let mut branch_refresh = use_signal(|| 0u64);
-    use_effect(move || {
-        let project_id = draft().project_id;
-        let _ = branch_refresh();
-        if project_id.is_empty() {
-            return;
-        }
-        spawn(async move {
-            loading_branches.set(true);
-            match api::get::<ProjectBranchesResponse>(&format!(
-                "/api/project-branches?projectId={}",
-                api::encode_query(&project_id)
-            ))
-            .await
-            {
-                Ok(value) => branches.set(value.branches),
-                Err(error) => context.error(error),
-            }
-            loading_branches.set(false);
-        });
-    });
     rsx! {
         div { class: "overlay is-open", onclick: move |event| on_cancel.call(event) }
         section { class: "drawer is-open", role: "dialog", "aria-label": if is_new { "新建任务组" } else { "编辑任务组" },
             div { class: "drawer__head", if is_new { "新建任务组" } else { "编辑任务组" } span { class: "spacer" } button { class: "btn btn--ghost btn--icon", onclick: move |event| on_cancel.call(event), Icon { width: 17, height: 17, icon: LdX } } }
             div { class: "drawer__body",
-                div { class: "field", label { class: "field__label", "项目" } select { class: "select", value: "{draft().project_id}", disabled: !is_new, onchange: move |event| draft.write().project_id = event.value(), for project in projects { option { value: "{project.id}", selected: project.id == draft().project_id, "{project.name}" } } } }
+                div { class: "field", label { class: "field__label", "项目" } select { class: "select", value: "{draft().project_id}", disabled: !is_new, onchange: move |event| draft.write().project_id = event.value(), for project in &projects { option { value: "{project.id}", selected: project.id == draft().project_id, "{project.name}" } } } }
                 div { class: "field", label { class: "field__label", "任务组名称" } input { class: "input", value: "{draft().name}", oninput: move |event| draft.write().name = event.value() } }
                 div { class: "field", label { class: "field__label", "描述" } input { class: "input", value: "{draft().description}", oninput: move |event| draft.write().description = event.value() } }
-                div { class: "field", label { class: "field__label", "Git 分支" } div { class: "input-action", if branches().is_empty() { input { class: "input input--mono", value: "{draft().branch}", oninput: move |event| draft.write().branch = event.value() } } else { select { class: "select select--mono", value: "{draft().branch}", onchange: move |event| draft.write().branch = event.value(), for branch in branches() { option { value: "{branch}", "{branch}" } } } } button { class: "btn btn--icon", title: "重新拉取分支", disabled: loading_branches(), onclick: move |_| branch_refresh += 1, Icon { width: 15, height: 15, icon: LdRefreshCw } } } }
+                BranchPicker { project: projects.iter().find(|project| project.id == draft().project_id).cloned(), value: draft().branch, disabled: saving(), on_change: move |value| draft.write().branch = value }
                 if is_new && !groups.is_empty() { div { class: "field", label { class: "field__label", "初始参数" } select { class: "select", value: "{copy_from}", onchange: move |event| copy_from.set(event.value()), option { value: "", selected: copy_from().is_empty(), "使用参数默认值" } for group in groups { option { value: "{group.id}", selected: group.id == copy_from(), "从 {group.name} 复制" } } } } }
             }
             div { class: "drawer__foot", button { class: "btn", onclick: move |event| on_cancel.call(event), "取消" } button { class: "btn btn--primary", disabled: saving() || draft().name.trim().is_empty() || draft().branch.trim().is_empty() || draft().project_id.is_empty(), onclick: move |_| { let request = TaskGroupRequest { project_id: draft().project_id, name: draft().name, description: draft().description, branch: draft().branch, params: if is_new { definitions.iter().map(|definition| (definition.key.clone(), definition.default_value.clone())).collect::<BTreeMap<_, _>>() } else { draft().params }, copy_from_group_id: (!copy_from().is_empty()).then(&*copy_from), presets: None, hidden_params: None }; let id = id.clone(); spawn(async move { saving.set(true); let result = if is_new { api::post::<TaskGroup, _>("/api/task-groups", &request).await } else { api::put::<TaskGroup, _>(&format!("/api/task-groups/{id}"), &request).await }; match result { Ok(group) => { context.success(if is_new { "任务组已创建" } else { "任务组已保存" }); on_saved.call(group); }, Err(error) => context.error(error) } saving.set(false); }); }, if saving() { "保存中…" } else { "保存" } } }
@@ -530,15 +694,15 @@ fn TaskEditor(
                     div { class: "field", label { class: "field__label", "代码包 Git 地址" } input { class: "input input--mono", value: "{draft().code_repo_url}", oninput: move |event| draft.write().code_repo_url = event.value() } }
                     div { class: "field", label { class: "field__label", "资源包 Git 地址" } input { class: "input input--mono", value: "{draft().asset_repo_url}", oninput: move |event| draft.write().asset_repo_url = event.value() } }
                 } }
-                details { open: true, summary { "构建参数 JSON" } div { class: "details-body", JsonEditor { value: draft().build_args_json, dark, on_change: move |value| draft.write().build_args_json = value } if !json_valid { p { class: "field-error", "JSON 格式无效，修正后才能保存" } } } }
+                details { open: true, summary { "构建参数 JSON" } div { class: "details-body", PlaceholderHelp {} JsonEditor { value: draft().build_args_json, dark, on_change: move |value| draft.write().build_args_json = value } if !json_valid { p { class: "field-error", "JSON 格式无效，修正后才能保存" } } } }
                 details { summary { "混淆与死代码" } div { class: "details-body form-grid form-grid--two",
                     label { class: "checkbox", input { r#type: "checkbox", checked: draft().enable_obfuscation, onchange: move |event| draft.write().enable_obfuscation = event.checked() } "启用混淆" }
                     if draft().enable_obfuscation { div { class: "field", label { class: "field__label", "混淆模式" } select { class: "select", value: if draft().obfuscation_mode == ObfuscationMode::Ast { "ast" } else { "classic" }, onchange: move |event| draft.write().obfuscation_mode = if event.value() == "ast" { ObfuscationMode::Ast } else { ObfuscationMode::Classic }, option { value: "classic", "经典" } option { value: "ast", "AST" } } } }
                     label { class: "checkbox", input { r#type: "checkbox", checked: draft().enable_dead_code_injection, onchange: move |event| draft.write().enable_dead_code_injection = event.checked() } "注入死代码" }
                     if draft().enable_dead_code_injection { div { class: "field", label { class: "field__label", "注入数量" } input { class: "input", r#type: "number", min: "1", value: "{draft().dead_code_injection_count}", oninput: move |event| if let Ok(value) = event.value().parse() { draft.write().dead_code_injection_count = value; } } } }
                 } }
-                details { summary { "打包前准备" } div { class: "details-body", ActionList { actions: pre_actions, preps: preps.clone(), on_change: move |actions| draft.write().pre_build_actions = actions } } }
-                details { summary { "打包后准备" } div { class: "details-body", ActionList { actions: post_actions, preps, on_change: move |actions| draft.write().post_build_actions = actions } } }
+                details { summary { "打包前准备" } div { class: "details-body", PlaceholderHelp {} ActionList { actions: pre_actions, preps: preps.clone(), on_change: move |actions| draft.write().pre_build_actions = actions } } }
+                details { summary { "打包后准备" } div { class: "details-body", PlaceholderHelp {} ActionList { actions: post_actions, preps, on_change: move |actions| draft.write().post_build_actions = actions } } }
             }
             div { class: "drawer__foot", button { class: "btn", onclick: move |event| on_cancel.call(event), "取消" } button { class: "btn btn--primary", disabled: saving() || draft().name.trim().is_empty() || draft().task_group_id.is_empty() || !json_valid, onclick: move |event| { let mut request = draft(); remove_system_prep_param_values(&mut request.pre_build_actions); remove_system_prep_param_values(&mut request.post_build_actions); let id = id.clone(); spawn(async move { saving.set(true); let result = if is_new { api::post::<PackageTask, _>("/api/package-tasks", &request).await } else { api::put::<PackageTask, _>(&format!("/api/package-tasks/{id}"), &request).await }; match result { Ok(_) => { context.success(if is_new { "任务已创建" } else { "任务已保存" }); on_saved.call(event); }, Err(error) => context.error(error) } saving.set(false); }); }, Icon { width: 15, height: 15, icon: LdSave } if saving() { "保存中…" } else { "保存任务" } } }
         }
@@ -723,6 +887,32 @@ fn BatchPrepParam(parameter: PrepParam, values: Signal<HashMap<String, Value>>) 
     rsx! { div { class: "field", label { class: "field__label", "{parameter.name}" } if parameter.param_type == PrepParamType::Bool { label { class: "switch", input { r#type: "checkbox", checked: value.as_bool().unwrap_or(false), onchange: move |event| { values.write().insert(parameter.name.clone(), Value::Bool(event.checked())); } } i {} } } else if parameter.param_type == PrepParamType::Select { select { class: "select", value: "{text}", onchange: move |event| { values.write().insert(parameter.name.clone(), Value::String(event.value())); }, for option in parameter.options { option { value: "{option.value}", selected: option.value == text, "{option.label}" } } } } else { input { class: "input input--mono", value: "{text}", oninput: move |event| { let value = if parameter.param_type == PrepParamType::Int { event.value().parse::<i64>().map(Value::from).unwrap_or(Value::String(event.value())) } else { Value::String(event.value()) }; values.write().insert(parameter.name.clone(), value); } } } } }
 }
 
+fn selected_in_group(settings: &PublicSettings, selected: &[String], group: &str) -> Vec<String> {
+    let mut tasks = settings
+        .package_tasks
+        .iter()
+        .filter(|task| task.task_group_id == group && selected.contains(&task.id))
+        .collect::<Vec<_>>();
+    tasks.sort_by_key(|task| task.order);
+    tasks.into_iter().map(|task| task.id.clone()).collect()
+}
+
+fn ordered_selection(settings: &PublicSettings, selected: &[String]) -> Vec<String> {
+    let mut result = vec![];
+    for project in &settings.projects {
+        let mut groups = settings
+            .task_groups
+            .iter()
+            .filter(|group| group.project_id == project.id)
+            .collect::<Vec<_>>();
+        groups.sort_by_key(|group| group.order);
+        for group in groups {
+            result.extend(selected_in_group(settings, selected, &group.id));
+        }
+    }
+    result
+}
+
 fn task_runtime(
     task: &PackageTask,
     statuses: &BuildStatusResponse,
@@ -747,14 +937,24 @@ fn task_runtime(
         ))
 }
 
-fn start_tasks(ids: Vec<String>, context: AppContext, mut status: Signal<BuildStatusResponse>) {
+fn start_tasks(
+    ids: Vec<String>,
+    context: AppContext,
+    mut status: Signal<BuildStatusResponse>,
+    mut busy: Signal<String>,
+) {
+    if !busy.peek().is_empty() || status.peek().build_in_progress {
+        return;
+    }
     if ids.is_empty() {
         context.error("请先选择任务");
         return;
     }
+    busy.set("start".into());
     spawn(async move {
         match api::post::<Value, _>("/api/build/start", &json!({"taskIds": ids})).await {
             Ok(_) => {
+                status.write().build_in_progress = true;
                 context.success("构建任务已启动");
                 if let Ok(value) = api::get("/api/build/status").await {
                     status.set(value);
@@ -762,19 +962,42 @@ fn start_tasks(ids: Vec<String>, context: AppContext, mut status: Signal<BuildSt
             }
             Err(error) => context.error(error),
         }
+        busy.set(String::new());
     });
 }
 
-fn stop_task(id: String, context: AppContext) {
+fn stop_task(
+    id: String,
+    context: AppContext,
+    mut status: Signal<BuildStatusResponse>,
+    mut busy: Signal<String>,
+) {
+    if !busy.peek().is_empty() {
+        return;
+    }
+    busy.set("stop".into());
     spawn(async move {
         match api::post::<Value, _>("/api/build/stop", &json!({"taskId": id})).await {
-            Ok(_) => context.success("已请求停止当前构建队列"),
+            Ok(_) => {
+                status.write().cancel_requested = true;
+                context.success("已请求停止整个构建队列");
+            }
             Err(error) => context.error(error),
         }
+        busy.set(String::new());
     });
 }
 
-fn run_obfuscation(id: String, context: AppContext) {
+fn run_obfuscation(
+    id: String,
+    context: AppContext,
+    mut status: Signal<BuildStatusResponse>,
+    mut busy: Signal<String>,
+) {
+    if !busy.peek().is_empty() || status.peek().build_in_progress {
+        return;
+    }
+    busy.set("obfuscation".into());
     spawn(async move {
         match api::post_empty(
             &format!("/api/package-tasks/{id}/run-obfuscation"),
@@ -782,9 +1005,13 @@ fn run_obfuscation(id: String, context: AppContext) {
         )
         .await
         {
-            Ok(()) => context.success("已启动单独混淆"),
+            Ok(()) => {
+                status.write().build_in_progress = true;
+                context.success("已启动单独混淆");
+            }
             Err(error) => context.error(error),
         }
+        busy.set(String::new());
     });
 }
 
@@ -925,6 +1152,7 @@ mod tests {
                 status: TaskStatus::Running,
                 ..BuildTaskStatus::default()
             }],
+            ..BuildStatusResponse::default()
         };
 
         let (status, progress, step, error) = task_runtime(&task, &statuses);
@@ -1021,6 +1249,61 @@ mod tests {
         assert_eq!(
             on_match_targets[0].params.get("enabled"),
             Some(&json!(true))
+        );
+    }
+    #[test]
+    fn group_actions_never_include_hidden_selections_and_global_order_matches_sidebar() {
+        let settings = PublicSettings {
+            projects: vec![Project {
+                id: "p".into(),
+                ..Default::default()
+            }],
+            task_groups: vec![
+                TaskGroup {
+                    id: "b".into(),
+                    project_id: "p".into(),
+                    order: 2,
+                    ..Default::default()
+                },
+                TaskGroup {
+                    id: "a".into(),
+                    project_id: "p".into(),
+                    order: 1,
+                    ..Default::default()
+                },
+            ],
+            package_tasks: vec![
+                PackageTask {
+                    id: "b1".into(),
+                    task_group_id: "b".into(),
+                    ..Default::default()
+                },
+                PackageTask {
+                    id: "a2".into(),
+                    task_group_id: "a".into(),
+                    order: 2,
+                    ..Default::default()
+                },
+                PackageTask {
+                    id: "a1".into(),
+                    task_group_id: "a".into(),
+                    order: 1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let selected = vec![
+            "b1".into(),
+            "a2".into(),
+            "a1".into(),
+            "removed".into(),
+            "a1".into(),
+        ];
+        assert_eq!(selected_in_group(&settings, &selected, "b"), vec!["b1"]);
+        assert_eq!(
+            ordered_selection(&settings, &selected),
+            vec!["a1", "a2", "b1"]
         );
     }
 }

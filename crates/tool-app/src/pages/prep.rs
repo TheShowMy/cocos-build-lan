@@ -73,6 +73,7 @@ pub fn Prep() -> Element {
 
     rsx! {
         main { class: "page__main page__main--wide",
+            crate::package_ui::PlaceholderHelp {}
             div { class: "toolbar",
                 div { h1 { "打包准备" } p { class: "toolbar__subtitle", "维护可复用的 uv 脚本和运行参数" } }
                 span { class: "spacer" }
@@ -186,7 +187,7 @@ fn PrepEditor(
         div { class: "overlay is-open", onclick: move |event| on_close.call(event) }
         section { class: "drawer drawer--wide is-open", role: "dialog", "aria-label": if is_new { "新建准备项目" } else { "编辑准备项目" },
             div { class: "drawer__head", if is_new { "新建准备项目" } else { "编辑准备项目" } span { class: "spacer" } button { class: "btn btn--ghost btn--icon", onclick: move |event| on_close.call(event), Icon { width: 17, height: 17, icon: LdX } } }
-            div { class: "drawer__body",
+            div { class: "drawer__body", crate::package_ui::PlaceholderHelp {}
                 div { class: "form-grid form-grid--two",
                     div { class: "field", label { class: "field__label", "名称" } input { class: "input", value: "{draft().name}", oninput: move |event| draft.write().name = event.value() } }
                     div { class: "field", label { class: "field__label", "说明" } input { class: "input", value: "{draft().description}", oninput: move |event| draft.write().description = event.value() } }

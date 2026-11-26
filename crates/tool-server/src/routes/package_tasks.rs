@@ -40,6 +40,7 @@ async fn create_task(
     State(state): State<AppState>,
     Json(request): Json<PackageTaskRequest>,
 ) -> Result<Json<PackageTask>, AppError> {
+    let _edit = state.settings_edit.lock().await;
     validate_task_request(&state, &request, None).await?;
     let mut settings = state.get_settings().await;
     let group = settings
@@ -73,6 +74,7 @@ async fn update_task(
     Path(task_id): Path<String>,
     Json(request): Json<PackageTaskRequest>,
 ) -> Result<Json<PackageTask>, AppError> {
+    let _edit = state.settings_edit.lock().await;
     validate_task_request(&state, &request, Some(&task_id)).await?;
     let runtime = state.get_task_runtime(&task_id).await?;
     if runtime.status == PackageTaskStatus::Running
@@ -121,6 +123,7 @@ async fn reorder_tasks(
     State(state): State<AppState>,
     Json(request): Json<PackageTaskReorderRequest>,
 ) -> Result<Json<Vec<PackageTask>>, AppError> {
+    let _edit = state.settings_edit.lock().await;
     state.find_task_group(request.task_group_id.trim()).await?;
     let mut settings = state.get_settings().await;
     let group_task_ids = settings
@@ -222,6 +225,7 @@ async fn duplicate_task(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Result<axum::Json<crate::models::PackageTask>, AppError> {
+    let _edit = state.settings_edit.lock().await;
     let mut settings = state.get_settings().await;
     let source = settings
         .package_tasks

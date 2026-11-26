@@ -80,12 +80,15 @@ pub async fn run_single_task(
     let task = state.find_task(task_id).await?;
     let (project, task_group) = state.resolve_task_context(&task).await?;
     let engine = state.find_engine(&project.engine_name).await?;
-    let version_prefix = project
-        .version
-        .split('.')
-        .take(3)
-        .collect::<Vec<_>>()
-        .join(".");
+    let version = task_group
+        .params
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AppError::validation("任务组缺少内置 version 参数"))?;
+    if !crate::services::parameters::valid_version(version) {
+        return Err(AppError::validation("任务组 version 格式无效"));
+    }
+    let version_prefix = crate::services::parameters::version_prefix(version).to_owned();
     let minor_version = project.minor_version.to_string();
 
     if task.build_args_json.trim().is_empty() {
@@ -236,7 +239,8 @@ pub async fn run_single_task(
             .map(|repo| repo.path.to_string_lossy().to_string())
             .unwrap_or_default(),
         &task_group.params,
-    );
+    )
+    .with_definitions(&settings.param_definitions);
 
     execute_prep_actions(
         state,

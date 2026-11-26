@@ -2,42 +2,23 @@
 
 [English](AGENTS.en.md)
 
-本文件是后续 agent 和开发者进入此生成项目时的第一入口。按当前任务读取最少必要内容，不要先通读所有实现或重做框架。
-
-## 先确认边界
-
-- 这是一个**单个可定制局域网工具**，不是工具宿主机、注册中心、反向代理或多工具平台。
-- 当前仍处开发期：配置结构、更新 manifest、LAN Dev 载荷、`active.json`、安装布局和启动方式均允许破坏性调整；不要为旧状态增加迁移或兼容分支。稳定版发布后删除这条规则并单独设计兼容策略。
-- `tool.json` 内的 `tool_id` 不可变。业务设置、API、更新清单、广播和运行实例都必须与它一致；不要通过配置 API 覆盖它。
-- v0.1 只假设可信局域网：用 `tool_id` 隔离工具，用 SHA-256 发现传输损坏；不要擅自加入账号、配对、签名或远程控制。
+这是单个可定制局域网构建工具，不是工具宿主或多工具平台。当前仅发布 Windows x64 npm 包。`tool.json` 的 `tool_id` 不可变；不要通过配置 API 覆盖。保持可信局域网范围，不擅自增加账号、配对或远程控制。
 
 ## 按任务阅读
 
-| 你的任务 | 先读 | 主要修改位置 |
-| --- | --- | --- |
-| 新增业务配置或业务状态 | [`docs/development.md`](docs/development.md) | `crates/tool-contract`、`tool-server`、`tool-control`、`tool-app` |
-| 新增或修改 Web 业务页面 | [`README.md`](README.md) 的“从哪里开始定制” | `crates/tool-app` |
-| 修改本机控制端页面、表单或状态卡片 | [`docs/development.md`](docs/development.md) | `crates/tool-control` |
-| 增加服务 API、任务或重启保护 | [`docs/restart-safety.md`](docs/restart-safety.md) | `crates/tool-server`，必要时 `tool-contract` |
-| 调整更新、LAN Dev、发布或回滚 | [`README.md`](README.md) 的“设置、更新与发布”、[`docs/dev-update.md`](docs/dev-update.md) | 仅在确有框架协议需求时修改 `tool-core` |
-| 修改此模板本身 | 生成项目外的模板仓库 `docs/development.md` | `template/`；必须重新生成项目验证 |
+- Web 设置及业务状态：[docs/development.md](docs/development.md)，修改 `tool-app`、`tool-server`，必要时修改 `tool-contract`。
+- TUI 与退出：[docs/restart-safety.md](docs/restart-safety.md)，修改服务内的 `tui`、`process` 与任务生命周期。
+- npm 发布：[README.md](README.md) 的发布部分，修改 `npm/` 和发布脚本。
 
-## 开发路径
+## 约束
 
-1. 业务字段放在 `BusinessSettings`，控制端可见业务摘要放在 `ToolStatus`；更新偏好保留在 `UpdateSettings`。
-2. 同步修改服务端的配置读写或业务 API、控制端的受控表单或真实状态卡片，以及需要时的 Web UI。
-3. 不要把设置退回 JSON 编辑器，也不要用模拟数据替代服务、PID、版本、更新或日志等真实运行状态。
-4. 优先改用户项目拥有的四个 crate：`tool-contract`、`tool-server`、`tool-control`、`tool-app`。`tool-core` 只放无 UI 的通用运行时和协议能力。
-5. `cargo run -p cocos-build-lan-control` 是开发模式。生产环境只能从首次安装包根目录的 `cocos-build-lan.exe` 启动；完整控制端更新由 launcher 接管，不能在开发模式自行替换控制端。
+1. 端口、Git 凭据、引擎定义和工作目录只能在本机 Web 设置；服务端必须校验连接来源、Host、Origin。远程业务配置不能夹带这些字段。
+2. Git Token 只写不读。文件/目录选择必须在服务所在机器唤起。不要使用浏览器上传路径代替真实本机路径。
+3. TUI 只显示地址、运行日志与操作提示，不恢复桌面控制端、更新器、广播或版本指针。
+4. npm 包只包含程序和只读资源。配置、业务数据与日志继续保存在现有工具数据目录；不要为开发期结构变化增加迁移框架。
+5. 长任务必须持有活动操作保护，后台任务保留保护至任务完成。外部命令统一使用受控 `process::Command`，退出清理不能杀死无关进程。
+6. 保留现有 Web 业务与构建行为，按任务做必要修改，不重做框架或引入模拟状态。
 
 ## 验证
 
-普通业务改动至少运行：
-
-```bash
-cargo fmt --check
-cargo test --workspace
-cargo check --workspace
-```
-
-实际启动控制端，确认服务启动、配置保存、真实状态读取和主题切换可用。涉及生命周期或更新时，额外验证健康检查、`readiness → prepare → readiness → shutdown`、完整包交接、健康失败回滚和 `active.json` 一致性。
+运行 `cargo fmt --check`、`cargo test --workspace`、`cargo check --workspace`、`cargo clippy --workspace --all-targets -- -D warnings`。UI 改动需构建 Web，并验证本机和远程行为。发布需检查 npm 包、冷启动、版本和数据保留；生命周期需验证退出确认、所有任务取消、子进程收尾及异常恢复。

@@ -127,6 +127,7 @@ mod tests {
         assert_eq!(
             value,
             json!({
+                "buildInProgress": false, "activeTaskId": null, "queuedTaskIds": [], "cancelRequested": false,
                 "packageTasks": [
                     {
                         "taskId": "task_1",
@@ -175,6 +176,57 @@ mod tests {
             "已有打包任务在进行中"
         );
 
+        let _ = tokio::fs::remove_dir_all(data_dir).await;
+    }
+    #[tokio::test]
+    async fn queue_status_tracks_waiting_active_cancel_and_cleanup() {
+        let (_app, state, data_dir) = app_with_single_task().await;
+        state.try_start_build().await.unwrap();
+        state
+            .prepare_tasks_for_build(&["task_1".into()])
+            .await
+            .unwrap();
+        let waiting = state.get_build_status().await;
+        assert!(waiting.build_in_progress);
+        assert_eq!(waiting.queued_task_ids, vec!["task_1"]);
+        state.set_active_task(Some("task_1".into())).await;
+        assert!(state.get_build_status().await.queued_task_ids.is_empty());
+        state.cancel_active_build("task_1").await.unwrap();
+        assert!(state.get_build_status().await.cancel_requested);
+        state.finish_build().await;
+        let finished = state.get_build_status().await;
+        assert!(!finished.build_in_progress);
+        assert!(!finished.cancel_requested);
+        assert!(finished.active_task_id.is_none());
+        assert!(finished.queued_task_ids.is_empty());
+        let _ = tokio::fs::remove_dir_all(data_dir).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_work_even_outside_the_cocos_phase() {
+        let (_app, state, data_dir) = app_with_single_task().await;
+        state.try_start_build().await.unwrap();
+        state.set_active_task(Some("task_1".into())).await;
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (dropped, drop_result) = tokio::sync::oneshot::channel::<()>();
+        let task_state = state.clone();
+        let worker = tokio::spawn(async move {
+            crate::services::build::cancel_on_request(&task_state, async move {
+                let _drop_guard = dropped;
+                let _ = started.send(());
+                std::future::pending::<Result<(), AppError>>().await
+            })
+            .await
+        });
+        ready.await.unwrap();
+        state.cancel_active_build("task_1").await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(AppError::Canceled(_))));
+        assert!(drop_result.await.is_err());
+        state.finish_build().await;
         let _ = tokio::fs::remove_dir_all(data_dir).await;
     }
 }

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::models::{Engine, Project};
+use crate::models::{Engine, ParamDefinition, Project};
 
 fn normalize_placeholder_path(path: &str) -> String {
     path.replace('\\', "/")
@@ -10,20 +10,9 @@ fn normalize_placeholder_path(path: &str) -> String {
 
 #[derive(Debug, Clone)]
 pub struct PlaceholderContext {
-    pub version: String,
-    pub version_prefix: String,
-    pub minor_version: String,
-    pub build_mode: String,
-    pub build_mode_uppercase: String,
-    pub is_hot_update: String,
-    pub enable_pay: String,
-    pub review_mode: String,
-    pub project_branch: String,
     pub project_path: String,
-    pub engine_path: String,
-    pub code_package_path: String,
-    pub remote_package_path: String,
-    pub params: BTreeMap<String, String>,
+    replacements: BTreeMap<String, String>,
+    params: BTreeMap<String, Value>,
 }
 
 impl PlaceholderContext {
@@ -55,83 +44,71 @@ impl PlaceholderContext {
         remote_package_path: String,
         params: &BTreeMap<String, Value>,
     ) -> Self {
-        let version_prefix = project
-            .version
-            .split('.')
-            .take(3)
-            .collect::<Vec<_>>()
-            .join(".");
-        let build_mode = project.build_mode.as_str().to_string();
-        let build_mode_uppercase = build_mode.to_uppercase();
-
+        let _ = project;
+        let project_path = normalize_placeholder_path(&project_path);
+        let replacements = BTreeMap::from([
+            ("project_branch".into(), project_branch),
+            ("project_path".into(), project_path.clone()),
+            (
+                "engine_path".into(),
+                normalize_placeholder_path(&engine.path),
+            ),
+            (
+                "code_package_path".into(),
+                normalize_placeholder_path(&code_package_path),
+            ),
+            (
+                "remote_package_path".into(),
+                normalize_placeholder_path(&remote_package_path),
+            ),
+            (
+                "code_repo_path".into(),
+                normalize_placeholder_path(&code_package_path),
+            ),
+            (
+                "asset_repo_path".into(),
+                normalize_placeholder_path(&remote_package_path),
+            ),
+        ]);
         Self {
-            version: project.version.clone(),
-            version_prefix,
-            minor_version: project.minor_version.to_string(),
-            build_mode,
-            build_mode_uppercase,
-            is_hot_update: if project.is_hot_update {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            },
-            enable_pay: if project.enable_pay {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            },
-            review_mode: if project.review_mode {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            },
-            project_branch,
-            project_path: normalize_placeholder_path(&project_path),
-            engine_path: normalize_placeholder_path(&engine.path),
-            code_package_path: normalize_placeholder_path(&code_package_path),
-            remote_package_path: normalize_placeholder_path(&remote_package_path),
-            params: params
-                .iter()
-                .map(|(key, value)| (key.clone(), render_param_value(value)))
-                .collect(),
+            project_path,
+            replacements,
+            params: params.clone(),
         }
+        .with_definitions(&[])
+    }
+
+    pub fn with_definitions(mut self, definitions: &[ParamDefinition]) -> Self {
+        self.replacements
+            .retain(|key, _| super::parameters::SYSTEM_KEYS.contains(&key.as_str()));
+        // Parameters cannot override the reserved system context even for invalid legacy settings.
+        for (key, value) in super::parameters::render_aliases(definitions, &self.params) {
+            if !super::parameters::SYSTEM_KEYS.contains(&key.as_str()) {
+                self.replacements.insert(key, value);
+            }
+        }
+        self
     }
 
     pub fn replace_text(&self, input: &str) -> String {
-        let replacements = [
-            ("${version}", self.version.as_str()),
-            ("${version_prefix}", self.version_prefix.as_str()),
-            ("${minor_version}", self.minor_version.as_str()),
-            ("${build_mode}", self.build_mode.as_str()),
-            ("${BUILD_MODE}", self.build_mode_uppercase.as_str()),
-            ("${is_hot_update}", self.is_hot_update.as_str()),
-            ("${enable_pay}", self.enable_pay.as_str()),
-            ("${review_mode}", self.review_mode.as_str()),
-            ("${project_branch}", self.project_branch.as_str()),
-            ("${project_path}", self.project_path.as_str()),
-            ("${engine_path}", self.engine_path.as_str()),
-            ("${code_package_path}", self.code_package_path.as_str()),
-            ("${remote_package_path}", self.remote_package_path.as_str()),
-            ("${code_repo_path}", self.code_package_path.as_str()),
-            ("${asset_repo_path}", self.remote_package_path.as_str()),
-        ];
-
-        let mut result = input.to_string();
-        for (placeholder, value) in replacements {
-            result = result.replace(placeholder, value);
+        let mut remaining = input;
+        let mut output = String::with_capacity(input.len());
+        while let Some(start) = remaining.find("${") {
+            output.push_str(&remaining[..start]);
+            let token = &remaining[start..];
+            let Some(end) = token.find('}') else {
+                output.push_str(token);
+                return output;
+            };
+            match self.replacements.get(&token[2..end]) {
+                Some(value) => output.push_str(value),
+                None => output.push_str(&token[..=end]),
+            }
+            remaining = &token[end + 1..];
         }
-        for (key, value) in &self.params {
-            result = result.replace(&format!("${{param.{key}}}"), value);
-        }
-        result
+        output.push_str(remaining);
+        output
     }
-}
-
-fn render_param_value(value: &Value) -> String {
-    value
-        .as_str()
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| value.to_string())
 }
 
 #[cfg(test)]
@@ -141,7 +118,7 @@ mod tests {
     use super::*;
 
     fn sample_context() -> PlaceholderContext {
-        PlaceholderContext::new(
+        PlaceholderContext::new_with_params(
             &Project {
                 id: "project_1".to_string(),
                 name: "demo".to_string(),
@@ -163,7 +140,59 @@ mod tests {
             "C:\\workspace\\project".to_string(),
             "C:\\workspace\\code".to_string(),
             "C:\\workspace\\asset".to_string(),
+            &BTreeMap::from([
+                ("version".into(), serde_json::json!("6.7.3.1")),
+                ("minor_version".into(), serde_json::json!(4)),
+                ("build_mode".into(), serde_json::json!("test")),
+                ("review_mode".into(), serde_json::json!(true)),
+            ]),
         )
+        .with_definitions(&[
+            ParamDefinition {
+                key: "build_mode".into(),
+                kind: crate::models::ParamKind::Identifier,
+                ..Default::default()
+            },
+            ParamDefinition {
+                key: "review_mode".into(),
+                kind: crate::models::ParamKind::Switch,
+                ..Default::default()
+            },
+        ])
+    }
+
+    #[test]
+    fn version_prefix_requires_group_context_and_uses_last_separator() {
+        let standalone = PlaceholderContext::new(
+            &Project {
+                version: "9.9.9.9".into(),
+                ..Default::default()
+            },
+            &Engine::default(),
+            "main".into(),
+            "path".into(),
+            "".into(),
+            "".into(),
+        );
+        assert_eq!(
+            standalone.replace_text("${version}/${version_prefix}/${param.version}"),
+            "${version}/${version_prefix}/${param.version}"
+        );
+        for value in ["1.2", "1.2.3", "6.8.0.0"] {
+            let context = PlaceholderContext::new_with_params(
+                &Project::default(),
+                &Engine::default(),
+                "main".into(),
+                "path".into(),
+                "".into(),
+                "".into(),
+                &BTreeMap::from([("version".into(), serde_json::json!(value))]),
+            );
+            assert_eq!(
+                context.replace_text("${version_prefix}"),
+                crate::services::parameters::version_prefix(value)
+            );
+        }
     }
 
     #[test]
@@ -193,5 +222,34 @@ mod tests {
             &params,
         );
         assert_eq!(context.replace_text("${param.channel}"), "official");
+    }
+    #[test]
+    fn replacement_is_single_pass_and_manual_context_has_no_user_params() {
+        let params = BTreeMap::from([("channel".into(), serde_json::json!("${project_path}"))]);
+        let context = PlaceholderContext::new_with_params(
+            &Project::default(),
+            &Engine::default(),
+            String::new(),
+            "/project".into(),
+            String::new(),
+            String::new(),
+            &params,
+        );
+        assert_eq!(
+            context.replace_text("${channel}|${param.channel}|${missing}"),
+            "${project_path}|${project_path}|${missing}"
+        );
+        let context = PlaceholderContext::new(
+            &Project::default(),
+            &Engine::default(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        assert_eq!(
+            context.replace_text("${build_mode}|${param.version}"),
+            "${build_mode}|${param.version}"
+        );
     }
 }

@@ -12,26 +12,35 @@ pub async fn save_public_settings(
     state: &AppState,
     mut update: PublicSettingsUpdate,
 ) -> Result<AppSettings, AppError> {
+    let _edit = state.settings_edit.lock().await;
+    let builtin = super::parameters::builtin_version();
+    if update
+        .param_definitions
+        .iter()
+        .filter(|d| d.key == "version")
+        .count()
+        != 1
+        || update.param_definitions.iter().find(|d| d.key == "version") != Some(&builtin)
+    {
+        return Err(AppError::validation("系统内置 version 定义不可修改或删除"));
+    }
     normalize_update(&mut update);
-    validate_update(&update)?;
-
+    for definition in &mut update.param_definitions {
+        super::parameters::normalize_definition(definition)?;
+    }
     let mut settings = state.get_settings().await;
+    validate_update(&update, &settings.engines)?;
     validate_references(&settings, &update)?;
 
-    settings.engines = update.engines;
     settings.projects = update.projects;
     settings.feishu_bots = update.feishu_bots;
     settings.param_definitions = update.param_definitions;
-    normalize_group_params(&mut settings)?;
+    super::parameters::normalize_identifiers(&mut settings)?;
     state.save_settings(settings).await?;
     Ok(state.get_settings().await)
 }
 
 fn normalize_update(update: &mut PublicSettingsUpdate) {
-    for engine in &mut update.engines {
-        engine.name = engine.name.trim().to_owned();
-        engine.path = engine.path.trim().to_owned();
-    }
     for project in &mut update.projects {
         project.id = project.id.trim().to_owned();
         if project.id.is_empty() {
@@ -54,14 +63,18 @@ fn normalize_update(update: &mut PublicSettingsUpdate) {
         definition.key = definition.key.trim().to_owned();
         definition.label = definition.label.trim().to_owned();
         definition.description = definition.description.trim().to_owned();
-        definition.options = definition
-            .options
-            .iter()
-            .map(|option| option.trim().to_owned())
-            .filter(|option| !option.is_empty())
-            .collect();
-        definition.order = order as u32;
-        if definition.kind != ParamKind::Select {
+        if definition.kind != ParamKind::Identifier {
+            definition.options = definition
+                .options
+                .iter()
+                .map(|option| option.trim().to_owned())
+                .filter(|option| !option.is_empty())
+                .collect();
+        }
+        if definition.key != "version" {
+            definition.order = order as u32;
+        }
+        if !matches!(definition.kind, ParamKind::Select | ParamKind::Identifier) {
             definition.options.clear();
         }
         if definition.kind == ParamKind::Number {
@@ -70,9 +83,12 @@ fn normalize_update(update: &mut PublicSettingsUpdate) {
     }
 }
 
-fn validate_update(update: &PublicSettingsUpdate) -> Result<(), AppError> {
+fn validate_update(
+    update: &PublicSettingsUpdate,
+    engines: &[crate::models::Engine],
+) -> Result<(), AppError> {
     let mut engine_names = HashSet::new();
-    for engine in &update.engines {
+    for engine in engines {
         if engine.name.is_empty() || engine.path.is_empty() {
             return Err(AppError::validation("引擎名称和路径不能为空"));
         }
@@ -118,6 +134,7 @@ fn validate_update(update: &PublicSettingsUpdate) -> Result<(), AppError> {
         }
     }
 
+    super::parameters::validate_aliases(&update.param_definitions)?;
     let mut parameter_keys = HashSet::new();
     for definition in &update.param_definitions {
         validate_definition(definition)?;
@@ -194,32 +211,6 @@ fn validate_references(
     Ok(())
 }
 
-fn normalize_group_params(settings: &mut AppSettings) -> Result<(), AppError> {
-    for group in &mut settings.task_groups {
-        let mut params = std::collections::BTreeMap::new();
-        for definition in &settings.param_definitions {
-            let mut value = group
-                .params
-                .get(&definition.key)
-                .filter(|value| is_empty(value) || value_matches_kind(value, &definition.kind))
-                .cloned()
-                .unwrap_or_else(|| definition.default_value.clone());
-            if definition.kind == ParamKind::Number {
-                normalize_integral_number(&mut value);
-            }
-            if definition.required && is_empty(&value) {
-                return Err(AppError::validation(format!(
-                    "任务组 {} 的参数 {} 缺少有效值",
-                    group.name, definition.label
-                )));
-            }
-            params.insert(definition.key.clone(), value);
-        }
-        group.params = params;
-    }
-    Ok(())
-}
-
 pub(crate) fn normalize_integral_number(value: &mut Value) -> bool {
     let Some(number) = value.as_number() else {
         return false;
@@ -257,7 +248,9 @@ fn valid_parameter_key(value: &str) -> bool {
 
 fn value_matches_kind(value: &Value, kind: &ParamKind) -> bool {
     match kind {
-        ParamKind::Text | ParamKind::Select => value.is_string(),
+        ParamKind::Text | ParamKind::Select | ParamKind::Identifier | ParamKind::Version => {
+            value.is_string()
+        }
         ParamKind::Number => value.is_number(),
         ParamKind::Switch => value.is_boolean(),
     }
@@ -272,22 +265,113 @@ mod tests {
     use super::*;
     use crate::models::{Engine, Project};
 
-    #[test]
-    fn rejects_duplicate_engines_and_invalid_webhook() {
-        let duplicate = PublicSettingsUpdate {
-            engines: vec![
-                Engine {
-                    name: "Cocos".to_owned(),
-                    path: "a".to_owned(),
-                },
-                Engine {
-                    name: "cocos".to_owned(),
-                    path: "b".to_owned(),
+    #[tokio::test]
+    async fn builtin_is_locked_and_type_changes_validate_all_saved_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::load(dir.path().to_path_buf()).await;
+        let original = state.get_settings().await;
+        for definitions in [
+            vec![],
+            vec![ParamDefinition {
+                kind: ParamKind::Text,
+                ..super::super::parameters::builtin_version()
+            }],
+            vec![
+                super::super::parameters::builtin_version(),
+                ParamDefinition {
+                    key: "version_prefix".into(),
+                    label: "bad".into(),
+                    default_value: serde_json::json!("x"),
+                    ..Default::default()
                 },
             ],
-            ..PublicSettingsUpdate::default()
-        };
-        assert!(validate_update(&duplicate).is_err());
+        ] {
+            assert!(
+                save_public_settings(
+                    &state,
+                    PublicSettingsUpdate {
+                        param_definitions: definitions,
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                state.get_settings().await.param_definitions,
+                original.param_definitions
+            );
+        }
+        let mut settings = original;
+        settings.param_definitions.push(ParamDefinition {
+            key: "sdk".into(),
+            label: "SDK".into(),
+            default_value: serde_json::json!("1.2"),
+            ..Default::default()
+        });
+        settings.task_groups.push(crate::models::TaskGroup {
+            id: "g".into(),
+            name: "G".into(),
+            branch: "main".into(),
+            presets: vec![crate::models::GroupParamPreset {
+                name: "invalid".into(),
+                params: std::collections::BTreeMap::from([(
+                    "sdk".into(),
+                    serde_json::json!("old"),
+                )]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        state.save_settings(settings).await.unwrap();
+        let mut settings = state.get_settings().await;
+        settings
+            .param_definitions
+            .iter_mut()
+            .find(|d| d.key == "sdk")
+            .unwrap()
+            .kind = ParamKind::Version;
+        let error = super::super::parameters::normalize_identifiers(&mut settings)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("预设 invalid"));
+        settings.task_groups[0].presets[0]
+            .params
+            .insert("sdk".into(), serde_json::json!("01.02"));
+        super::super::parameters::normalize_identifiers(&mut settings).unwrap();
+        assert_eq!(
+            settings.task_groups[0].schemes.as_ref().unwrap()[0].params["sdk"],
+            "1.2"
+        );
+        settings.param_definitions.retain(|d| d.key != "sdk");
+        super::super::parameters::normalize_identifiers(&mut settings).unwrap();
+        assert!(!settings.task_groups[0].params.contains_key("sdk"));
+        assert!(
+            !settings.task_groups[0].presets[0]
+                .params
+                .contains_key("sdk")
+        );
+        assert!(
+            !settings.task_groups[0].schemes.as_ref().unwrap()[0]
+                .params
+                .contains_key("sdk")
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_engines_and_invalid_webhook() {
+        let duplicate = PublicSettingsUpdate::default();
+        let engines = vec![
+            Engine {
+                name: "Cocos".to_owned(),
+                path: "a".to_owned(),
+            },
+            Engine {
+                name: "cocos".to_owned(),
+                path: "b".to_owned(),
+            },
+        ];
+        assert!(validate_update(&duplicate, &engines).is_err());
     }
 
     #[test]
@@ -302,7 +386,7 @@ mod tests {
             }],
             ..PublicSettingsUpdate::default()
         };
-        assert!(validate_update(&update).is_err());
+        assert!(validate_update(&update, &[]).is_err());
     }
 
     #[test]

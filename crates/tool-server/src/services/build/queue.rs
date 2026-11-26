@@ -76,6 +76,7 @@ async fn watch_cancel_timeouts(state: AppState) {
 }
 
 pub async fn start_build(state: AppState, request: BuildStartRequest) -> Result<(), AppError> {
+    let operation = state.operation().await?;
     state.try_start_build().await?;
     let tasks = match collect_requested_tasks(&state, &request).await {
         Ok(tasks) => tasks,
@@ -95,6 +96,7 @@ pub async fn start_build(state: AppState, request: BuildStartRequest) -> Result<
 
     let task_ids = request.task_ids;
     tokio::spawn(async move {
+        let _operation = operation;
         let _restart_guard = state.restart_guard("打包任务队列");
         let watchdog_state = state.clone();
         tokio::spawn(watch_cancel_timeouts(watchdog_state));
@@ -134,7 +136,9 @@ async fn run_build_queue(state: AppState, task_ids: Vec<String>) -> Result<(), A
             break;
         }
         state.set_active_task(Some(task_id.clone())).await;
-        match run_single_task(&state, task_id, &start_notify_logs).await {
+        match super::cancel_on_request(&state, run_single_task(&state, task_id, &start_notify_logs))
+            .await
+        {
             Ok(()) => {
                 if let Some(task) = task_snapshots.iter().find(|task| task.task_id == *task_id) {
                     success_tasks.push(FinishedTaskSummary {
@@ -256,6 +260,7 @@ async fn cancel_requested(state: &AppState) -> bool {
 }
 
 async fn cancel_remaining_tasks(state: &AppState, task_ids: &[String]) {
+    state.remove_queued_tasks(task_ids).await;
     for task_id in task_ids {
         let _ = state
             .update_task_runtime(task_id, RuntimeFlushMode::Immediate, |runtime| {

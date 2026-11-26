@@ -1,0 +1,30 @@
+{
+  "name": "@tsixi/cocos-build-lan",
+  "version": "0.2.2",
+  "description": "内网 Cocos 构建工具：TUI、Web 设置与构建服务",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "cocos-build-lan": "bin/cocos-build-lan.mjs"
+  },
+  "files": [
+    "bin",
+    "runtime",
+    "README.md"
+  ],
+  "dependencies": {
+    "typescript": "5.9.3"
+  },
+  "publishConfig": {
+    "registry": "http://192.168.2.33:4873"
+  }
+}

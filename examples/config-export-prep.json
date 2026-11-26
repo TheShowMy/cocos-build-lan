@@ -1,0 +1,111 @@
+{
+  "schemaVersion": 1,
+  "prep": {
+    "name": "配置拉取",
+    "description": "拉取配置使用",
+    "params": [
+      {
+        "name": "config_name",
+        "type": "select",
+        "valueSource": "runtime",
+        "optional": false,
+        "options": [
+          {
+            "id": "99ae5355-4bbe-44ba-87f0-a0c182d6ad6b",
+            "label": "外网h5-pro",
+            "value": "outer_pro"
+          },
+          {
+            "id": "fc9e61af-5b9b-4eb8-95c4-97f1ac373bf4",
+            "label": "外网h5-test",
+            "value": "outer_test"
+          },
+          {
+            "id": "794b5526-f10e-458d-834e-97fdbacd11f3",
+            "label": "公网-test",
+            "value": "public_test"
+          },
+          {
+            "id": "2839f478-82e7-4a3d-bac8-768abc29cd44",
+            "label": "拇指斗斗堂",
+            "value": "muzhi_ddt"
+          },
+          {
+            "id": "663422be-bbc5-4fe3-aadf-cebf9d55cdfa",
+            "label": "拇指百战斗斗堂",
+            "value": "muzhi_bzddt"
+          },
+          {
+            "id": "7387307b-d40c-49ec-a9af-9cca5e4f5037",
+            "label": "日本web",
+            "value": "japan_web"
+          },
+          {
+            "id": "df40d7f2-35cd-47bc-8e2b-6edf7bbeede6",
+            "label": "红包外网",
+            "value": "red_outer"
+          }
+        ],
+        "fixedValue": null
+      },
+      {
+        "name": "build_mode",
+        "type": "str",
+        "valueSource": "fixed",
+        "optional": false,
+        "options": [],
+        "fixedValue": "${build_mode}"
+      },
+      {
+        "name": "censor_switch",
+        "type": "str",
+        "valueSource": "fixed",
+        "optional": false,
+        "options": [],
+        "fixedValue": "${review_mode}"
+      },
+      {
+        "name": "test_branch",
+        "type": "str",
+        "valueSource": "runtime",
+        "optional": true,
+        "options": [],
+        "fixedValue": null
+      },
+      {
+        "name": "censor_branch",
+        "type": "str",
+        "valueSource": "runtime",
+        "optional": true,
+        "options": [],
+        "fixedValue": null
+      },
+      {
+        "name": "release_branch",
+        "type": "str",
+        "valueSource": "runtime",
+        "optional": true,
+        "options": [],
+        "fixedValue": null
+      }
+    ]
+  },
+  "files": [
+    {
+      "path": "lib.py",
+      "content": "\"\"\"通过固定版本的 npm Rust 工具导出配置；不需要 Python 2。\"\"\"\n\nimport os\nfrom pathlib import Path\nimport shutil\nimport subprocess\nimport sys\n\nfrom models import Person\n\n\nPACKAGE_SPEC = \"@tsixi/export-config@0.1.2\"\nREGISTRY = \"http://192.168.2.33:4873\"\n\n\ndef select_branch(person: Person) -> str:\n    branch = person.release_branch if person.build_mode == \"release\" else person.test_branch\n    if person.censor_switch == \"true\":\n        branch = person.censor_branch\n    return branch or \"master\"\n\n\ndef npm_command() -> list[str]:\n    # 使用启动打包工具的 Node，避免意外使用 Cocos 或其他软件附带的 Node。\n    node = os.environ.get(\"COCOS_BUILD_LAN_NODE_EXE\") or shutil.which(\"node\")\n    if not node or not Path(node).is_file():\n        raise RuntimeError(\"未找到 Node.js，请安装含 npm 的 Node.js 并重新启动服务\")\n    node = Path(node).resolve()\n    candidates = [node.parent / \"node_modules/npm/bin/npm-cli.js\"]\n    inherited_npm = os.environ.get(\"npm_execpath\")\n    if inherited_npm:\n        # npx 启动的服务可能继承 npx-cli.js；它会自动添加 exec，不能当 npm 调用。\n        inherited = Path(inherited_npm)\n        if inherited.name.lower() in (\"npm-cli.js\", \"npx-cli.js\"):\n            candidates.append(inherited.with_name(\"npm-cli.js\"))\n    npm_wrapper = shutil.which(\"npm.cmd\" if os.name == \"nt\" else \"npm\")\n    if npm_wrapper:\n        wrapper = Path(npm_wrapper)\n        candidates.extend([\n            wrapper.resolve(),\n            wrapper.parent / \"node_modules/npm/bin/npm-cli.js\",\n        ])\n    for candidate in candidates:\n        if candidate.name.lower() == \"npm-cli.js\" and candidate.is_file():\n            return [str(node), str(candidate.resolve())]\n    raise RuntimeError(\"未找到 npm-cli.js，请修复 Node.js/npm 安装后重新启动服务\")\n\n\ndef process_person(person: Person):\n    # 服务按 UTF-8 解码 stdout/stderr；Windows 默认 stderr 可能仍是 GBK。\n    for stream in (sys.stdout, sys.stderr):\n        if hasattr(stream, \"reconfigure\"):\n            stream.reconfigure(encoding=\"utf-8\", errors=\"replace\")\n    try:\n        project_root = Path(person.project_path).resolve()\n        channel_config = project_root / \"python/config/channel.json\"\n        if not channel_config.is_file():\n            raise RuntimeError(f\"渠道配置文件不存在：{channel_config}\")\n\n        prep_root = Path(__file__).resolve().parent\n        config_dir = prep_root / \"data\" / person.config_name\n        runtime_dir = project_root / \"tool_data/export_config\"\n        branch = select_branch(person)\n        command = npm_command()\n        command.extend([\n            \"exec\", \"--yes\", \"--prefer-offline\", f\"--registry={REGISTRY}\",\n            f\"--package={PACKAGE_SPEC}\", \"--\", \"export-config\",\n            \"-c\", person.config_name, \"-p\", str(config_dir), \"-b\", branch,\n            \"--project-root\", str(project_root),\n            \"--channel-config\", str(channel_config),\n            \"--runtime-dir\", str(runtime_dir), \"--force-export\",\n        ])\n        print(f\"配置导出工具：{PACKAGE_SPEC}\", flush=True)\n        print(f\"渠道：{person.config_name}；分支：{branch}\", flush=True)\n        print(f\"目标项目：{project_root}\", flush=True)\n\n        env = os.environ.copy()\n        # npm 创建的命令入口也应使用同一套 Node。\n        env[\"PATH\"] = str(Path(command[0]).parent) + os.pathsep + env.get(\"PATH\", \"\")\n        result = subprocess.run(\n            command, cwd=project_root, env=env, stdin=subprocess.DEVNULL,\n            creationflags=subprocess.CREATE_NO_WINDOW if os.name == \"nt\" else 0,\n            check=False,\n        )\n    except (OSError, RuntimeError) as error:\n        print(f\"配置导出启动失败：{error}\", file=sys.stderr, flush=True)\n        raise SystemExit(1) from error\n    if result.returncode:\n        print(f\"配置导出失败，退出码：{result.returncode}\", file=sys.stderr, flush=True)\n        raise SystemExit(result.returncode if result.returncode > 0 else 1)\n    print(\"配置导出完成\", flush=True)\n"
+    },
+    {
+      "path": "main.py",
+      "content": "##不要动main.py里的代码\nimport argparse\nimport sys\nimport io\nfrom lib import process_person\nfrom models import Person\n\nif sys.stdout.encoding != 'utf-8':\n    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')\n\ndef main():\n    parser = argparse.ArgumentParser(description=\"请输入参数\")\n    parser.add_argument(\"--project_path\", type=str, required=True, help=\"请输入project_path\")\n    parser.add_argument(\"--config_name\", type=str, required=True, help=\"请输入config_name\")\n    parser.add_argument(\"--build_mode\", type=str, required=True, help=\"请输入build_mode\")\n    parser.add_argument(\"--censor_switch\", type=str, required=True, help=\"请输入censor_switch\")\n    parser.add_argument(\"--test_branch\", type=str, required=False, help=\"请输入test_branch\")\n    parser.add_argument(\"--censor_branch\", type=str, required=False, help=\"请输入censor_branch\")\n    parser.add_argument(\"--release_branch\", type=str, required=False, help=\"请输入release_branch\")\n\n    args = parser.parse_args()\n    person = Person(project_path=args.project_path, config_name=args.config_name, build_mode=args.build_mode, censor_switch=args.censor_switch, test_branch=args.test_branch, censor_branch=args.censor_branch, release_branch=args.release_branch)\n    process_person(person)\n\nif __name__ == \"__main__\":\n    main()\n"
+    },
+    {
+      "path": "models.py",
+      "content": "from dataclasses import dataclass\n\n@dataclass\nclass Person:\n    project_path: str\n    config_name: str\n    build_mode: str\n    censor_switch: str\n    test_branch: str = None\n    censor_branch: str = None\n    release_branch: str = None\n"
+    },
+    {
+      "path": "pyproject.toml",
+      "content": "[project]\nname = \"prep-1774074264321372000\"\nversion = \"0.1.0\"\nrequires-python = \">=3.14\"\ndependencies = []\n"
+    }
+  ]
+}

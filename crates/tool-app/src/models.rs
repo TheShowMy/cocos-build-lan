@@ -25,7 +25,6 @@ pub struct PublicSettings {
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicSettingsUpdate {
-    pub engines: Vec<Engine>,
     pub projects: Vec<Project>,
     pub feishu_bots: Vec<FeishuBot>,
     pub param_definitions: Vec<ParamDefinition>,
@@ -34,7 +33,6 @@ pub struct PublicSettingsUpdate {
 impl From<&PublicSettings> for PublicSettingsUpdate {
     fn from(value: &PublicSettings) -> Self {
         Self {
-            engines: value.engines.clone(),
             projects: value.projects.clone(),
             feishu_bots: value.feishu_bots.clone(),
             param_definitions: value.param_definitions.clone(),
@@ -100,6 +98,34 @@ pub struct GroupParamPreset {
     pub params: BTreeMap<String, Value>,
 }
 
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BuildScheme {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    pub branch: String,
+    #[serde(default)]
+    pub params: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemeApplied {
+    pub scheme_id: String,
+    pub group: TaskGroup,
+    pub task_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct PlaceholderInfo {
+    pub reference: String,
+    pub description: String,
+    pub builtin: bool,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskGroup {
@@ -113,6 +139,8 @@ pub struct TaskGroup {
     pub params: BTreeMap<String, Value>,
     #[serde(default)]
     pub presets: Vec<GroupParamPreset>,
+    #[serde(default)]
+    pub schemes: Option<Vec<BuildScheme>>,
     #[serde(default)]
     pub hidden_params: Vec<String>,
     #[serde(default)]
@@ -138,11 +166,13 @@ pub struct TaskGroupRequest {
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskGroupParamsRequest {
+    #[serde(default)]
+    pub scheme_id: Option<String>,
     pub branch: String,
     pub params: BTreeMap<String, Value>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ParamKind {
     #[default]
@@ -150,6 +180,8 @@ pub enum ParamKind {
     Number,
     Switch,
     Select,
+    Identifier,
+    Version,
 }
 
 impl ParamKind {
@@ -159,6 +191,8 @@ impl ParamKind {
             Self::Number => "数字",
             Self::Switch => "开关",
             Self::Select => "选择",
+            Self::Identifier => "英文标识",
+            Self::Version => "版本号",
         }
     }
 }
@@ -363,6 +397,14 @@ pub struct TaskPrepTarget {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildStatusResponse {
+    #[serde(default)]
+    pub build_in_progress: bool,
+    #[serde(default)]
+    pub active_task_id: Option<String>,
+    #[serde(default)]
+    pub queued_task_ids: Vec<String>,
+    #[serde(default)]
+    pub cancel_requested: bool,
     #[serde(default)]
     pub package_tasks: Vec<BuildTaskStatus>,
 }

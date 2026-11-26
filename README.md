@@ -2,129 +2,80 @@
 
 [English](README.en.md)
 
-这是一个完全属于你的局域网工具项目。模板生成时会写入不可变的 UUID `tool_id` 到 `tool.json`；之后所有 Rust 源码、业务配置和控制端界面都可在本仓库修改。
+Windows x64 内网构建工具。一个 Rust 进程运行 TUI、Web 和构建任务，通过内网 npm 仓库交付完整程序。
 
-> 使用 agent 或开始开发前，先阅读根目录的 [`AGENTS.md`](AGENTS.md)。它按任务路由到最少必要文档与 crate；英文版本见 [AGENTS.en.md](AGENTS.en.md)。
+## 运行
 
-## 首次运行
+部署机器安装 Node.js 22+、Git、uv 和所需 Cocos Creator，然后运行：
 
-需要 Rust 1.97.1：
-
-```bash
-# 开发模式：先构建服务端，控制端从 target/debug 同级启动
-cargo build -p cocos-build-lan-server
-
-# 本机控制端：接管已有匹配服务，或启动服务端
-cargo run -p cocos-build-lan-control
+```powershell
+npx --yes --prefer-online --registry=http://192.168.2.33:4873 @tsixi/cocos-build-lan@latest
 ```
 
-控制端窗口标题为 `cocos-build-lan 控制端`，使用平台原生标题栏。它的“启动 / 重启 / 停止”按钮调用真实服务端：重启严格经过 readiness、prepare 和 shutdown；无法确认归属的进程不会被强杀。
+显式查询 `latest`；正在运行的版本不会自行替换，下次启动使用仓库最新版本。需要固定版本时使用 `@0.2.2`。内网仓库不可用时先恢复网络，不依赖缓存是否恰好存在。
 
-若只需要运行 Web 工具，先用 dx 构建 SPA 再启动服务端：
+TUI 显示本机和局域网地址、服务日志及任务关键进度。鼠标单击地址，或用 Tab/方向键选择后 Enter 打开；S 打开本机设置。空格暂停日志、PgUp/PgDn 翻页、End 恢复跟随。Q/Ctrl+C 先询问，确认后取消所有任务并退出。完整构建输出在 Web“构建日志”查看。`--no-tui` 使用普通日志模式，退出信号直接触发任务清理。
 
-```bash
-# 构建 Web SPA（需要 dioxus-cli：cargo install dioxus-cli --locked）
-scripts/build-web.sh
+重复启动会提示已有实例及地址，不接管或关闭它。关闭旧实例后再启动新版。
 
+## Web 设置
+
+在服务机器访问本机地址或本机局域网地址，设置端口、Git 凭据、引擎路径和构建工作目录。远程访问上述区域会显示“请在服务启动的机器上访问设置。”；项目、飞书、任务参数及构建仍可远程管理，项目仍可选用已配置的引擎。
+
+- Git Token 只写不读。留空保留，填新值替换，显式勾选清除才删除。
+- 引擎可选择 `CocosCreator.exe`，也可手填安装目录或可执行文件完整路径。
+- 工作目录支持系统目录窗口，必须存在且可写。推荐短路径，如 `D:\lan-workspaces`；切换不会搬移旧文件，可能需要重新初始化项目。
+- 活动任务期间不能修改引擎与工作目录。端口变更保存后下次启动生效。
+- 飞书配置仍开放给可信局域网用户。
+
+## 数据与日志
+
+`tool.json` 中的 `tool_id` 不变。默认数据位置仍是系统本地应用数据目录下 `lan-toolkit/<tool_id>/`，保留 `config/tool-settings.json`、`data/cocos-build/` 和 `logs/server.log`。配置、工作区和日志不放在 npm 安装目录中，删除 npm 缓存不会删除业务数据。
+
+首次 npm 版本启动会把已有配置和运行态备份到数据目录的 `backups/before-npm-0.2/`，随后从配置中移除废弃更新字段。旧 releases/staging 文件不会再被使用，也不会自动清理用户磁盘文件。
+
+`COCOS_BUILD_LAN_DATA_ROOT` 可指定独立数据根目录进行测试；不要在正常升级时变更它。
+
+## 开发
+
+先阅读 [AGENTS.md](AGENTS.md)。Rust 1.97.1+，Web 需要 `wasm32-unknown-unknown`、Dioxus CLI、nightly 和 pnpm。
+
+```powershell
 cargo run -p cocos-build-lan-server
-# 当前 tool_id 的首选业务端口为 44588
-# 浏览器打开 http://127.0.0.1:44588
-```
-
-开发模式下服务端从可执行文件同级的 `web/` 提供页面，即 `target/debug/web`；把它软链到 dx 产物目录一次即可：`ln -sfn ../dx/cocos-build-lan/release/web/public target/debug/web`。未构建 SPA 时首页只显示占位提示文本。
-
-开发 Web UI 推荐热更新方式（改 `crates/tool-app/src` 自动重建刷新）：
-
-```bash
-# 终端 1：服务端（或用控制端 cargo run -p cocos-build-lan-control）
-cargo run -p cocos-build-lan-server
-
-# 终端 2：dx 热更新，浏览器打开 http://127.0.0.1:8080
+# 单独开发 Web：
+$env:COCOS_BUILD_LAN_DEV_ORIGIN='http://127.0.0.1:8080'
+# 设置该变量的终端启动 Rust 服务；另一个终端运行：
 dx serve --package cocos-build-lan-app
 ```
 
-`Dioxus.toml` 已配置 `[[web.proxy]]`，dx dev server 会把 `/api/*` 代理到当前项目首选业务端口 44588。若已在控制端改过端口，同时修改此开发代理地址。
+`Dioxus.toml` 的代理默认指向 44588；改端口后同步修改代理。生产包从可执行文件相邻的 `web/` 与 `scripts/` 读取资源；开发时可用 `COCOS_BUILD_LAN_WEB_ROOT` 指定 Web 产物。
 
-## 从哪里开始定制
+- `tool-server`：Web API、TUI、任务与受控子进程。
+- `tool-app`：现有 Dioxus Web 业务界面。
+- `tool-contract`：本机配置类型。
+- `tool-core`：工具身份、数据路径及活动任务保护。
+- `obfuscation-cli`：原有混淆实现；长时间混淆通过受控工作进程执行。
 
-| 位置 | 你拥有的内容 |
-| --- | --- |
-| `crates/tool-contract` | `ToolSettings`、`ToolStatus` 和任何服务/控制端共用的业务类型 |
-| `crates/tool-server` | API、业务状态、配置持久化、长任务的 `RestartGuard` |
-| `crates/tool-control` | 完整 Dioxus Desktop 页面、导航、业务卡片、表单和主题样式 |
-| `crates/tool-app` | 浏览器业务 UI |
-| `crates/tool-core` | 无 UI 的本地运行时、更新、监督和 LAN Dev。通常只在需要改变框架行为时编辑 |
-
-最小扩展路径：在 `ToolSettings` 添加字段，在 `tool-server` 的 `GET/PUT /api/control-config` 处理它，再在 `tool-control` 的设置页渲染它。业务状态同理：扩展 `ToolStatus`、实现 `GET /api/control-status`，并在控制端添加卡片。
-
-新增业务字段的逐步说明见 [`docs/development.md`](docs/development.md)。
-
-`tool_id` 不属于业务配置，不能通过 `PUT /api/control-config` 修改。
-
-## 实际 API 与数据位置
-
-- `GET /healthz` 返回当前服务真实的 `tool_id`、协议和版本；它只监听由 `tool_id` 派生的本机回环控制端口。
-- `GET /_lan/control/restart-readiness`、`POST /prepare-restart`、`POST /shutdown` 提供安全生命周期协议。
-- `GET /api/control-status`、`GET/PUT /api/control-config` 是可直接改造的模板业务端点。
-- Web 页面和业务 API 监听设置页中的局域网业务端口；控制接口不会挂载到该端口。
-
-配置、数据、日志、暂存更新和 `active.json` 位于本机应用数据目录的 `<tool_id>/` 下；它们不在 release 目录，更新不会覆盖它们。服务端日志可从控制端的“日志”页读取。
-
-## 设置、更新与发布
-
-设置页是强类型表单，对应 `tool-contract` 中的：
-
-```rust
-ToolSettings { network: NetworkSettings { .. }, update: UpdateSettings { .. }, business: BusinessSettings { .. } }
-```
-
-在 `BusinessSettings` 增加业务字段后，同时在控制端设置表单增加对应控件即可。服务端只读写当前嵌套结构；开发期旧配置解析失败时，按错误提示删除本机 `config/tool-settings.json` 后重启生成默认值，不保留迁移分支。
-
-更新载荷始终是**当前平台的完整 ZIP 版本包**，其中固定包含 `bin/<项目名>-server` 和 `bin/<项目名>-control`。首次安装包根目录只有一个可启动文件 `cocos-build-lan.exe`，服务端、控制端、Web 和 scripts 均位于 `bin/`。生产环境只启动根目录入口；`cargo run -p cocos-build-lan-control` 始终是开发模式，因此不会把自身交给更新器替换。
-
-Windows x64 开发机可直接生成本地首次安装包；脚本同时保留后续 LAN Dev 所需的 Web 与运行脚本目录：
+## 发布
 
 ```powershell
-rustup target add wasm32-unknown-unknown
-rustup toolchain install nightly
-powershell -ExecutionPolicy Bypass -File scripts/build-windows-release.ps1
+./scripts/build-npm-release.ps1
+# 使用已登录的内网 npm 账户发布测试标签：
+./scripts/publish-npm-release.ps1 -Tag next
+npx --yes --prefer-online --registry=http://192.168.2.33:4873 @tsixi/cocos-build-lan@next
+# 冷启动验收后提升同一版本，不重新打包：
+./scripts/publish-npm-release.ps1 -Tag latest
 ```
 
-发布脚本使用锁定的 pnpm 依赖在开发机离线打包 CodeMirror 6；部署机不需要 Node 或 pnpm。
-
-1. 推送 `v*` tag 会触发 `.github/workflows/release.yml`，发布当前平台的 `bootstrap.zip`、`update.zip` 和 `manifest.json`。
-2. 将 `bootstrap.zip` 解压到干净目录后，只启动根目录 `cocos-build-lan.exe`。同一 `tool_id` 会继续使用本机应用数据目录中的配置和业务数据。
-3. 在控制端“设置”页填写 Release 清单 URL。控制端每六小时检查一次，也可在“更新”页立即检查；下载时校验工具 ID、包格式、平台、大小和 SHA-256。
-4. 仅在 `RestartReadiness::Ready` 且设置没有未保存修改时，控制端才退出并交给启动器：启动器等待旧控制端退出，安全停止服务、原子切换 `active.json`、启动新服务并做健康检查，随后打开新版控制端。
-5. 新服务健康检查失败时，启动器恢复旧指针并重新启动旧服务和旧控制端。`Deferred`、`ConfirmationRequired` 和 `Blocked` 会保留待应用包并在 UI 解释原因。
-
-开发机用服务端和控制端一起创建 LAN Dev 完整版本包：
-
-```powershell
-$env:__COMPAT_LAYER = "RunAsInvoker"
-cargo run -p cocos-build-lan-core --bin tool-dev-update -- `
-  tool.json target/release/cocos-build-lan-server.exe target/release/cocos-build-lan-control.exe `
-  --web dist/bootstrap/bin/web --scripts dist/bootstrap/bin/scripts `
-  --listen lan --advertise 192.168.2.7 --broadcast --version 0.1.3
-```
-
-只有在设置页打开并保存“接收可信局域网的 LAN Dev 完整版本包”后，控制端才会创建持久后台监听器。控制 TCP、默认业务 TCP 和 LAN 更新 UDP 候选都由不可变 `tool_id` 派生并自动避让，因此同机多个工具不会争用固定端口。发送器的 HTTP 端口由系统动态分配；广播仍先过滤来源、工具 ID、平台、包格式和重复版本，再下载校验。
-
-## 排障与安全边界
-
-- 启动失败：确认 `target/debug/cocos-build-lan-server`（开发）或 bootstrap 根目录入口与 `bin/` 内容完整；查看控制端日志页。
-- 局域网无法访问：使用控制端概览展示的具体网卡 URL，并在 Windows 防火墙中允许当前设置的业务 TCP 端口。
-- 更新不能应用：检查 restart readiness 的原因；`Deferred` 会等待，`ConfirmationRequired` 与 `Blocked` 需要业务明确解除。
-- 更新后健康检查失败：`active.json` 自动恢复，旧服务将被重新启动；保留日志和暂存信息用于诊断。
-
-v0.1 仅适用于可信局域网。对不可信网络，请在扩展项中加入身份认证、签名验证、传输加密和更严格的访问控制。
+同时调整 Cargo 工作区和 `npm/package.json` 版本。构建脚本校验版本、资源、包体积及敏感数据排除，输出 `dist/tsixi-cocos-build-lan-<version>.tgz`。`-SkipBuild` 只用于打包已核验的同版本产物。npm 登录凭据不写入仓库。
 
 ## 验证
 
-```bash
+```powershell
 cargo fmt --check
 cargo test --workspace
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo metadata --format-version 1
 ```
+
+另验证本机/远程权限、文件选择、TUI 退出、任务子进程清理和 npm 冷启动。仅面向可信局域网，不提供账号、配对或远程更新控制。服务日志不应记录 Git 凭据。

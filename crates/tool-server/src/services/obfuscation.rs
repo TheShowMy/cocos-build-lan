@@ -7,10 +7,9 @@ use obfuscation_cli::pipeline::{
     obfuscate::{RunConfig, run as run_obfuscation},
     whitelist::{WhitelistDocument, ensure_whitelist},
 };
-use tokio::task;
 use walkdir::WalkDir;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ObfuscationResult {
     pub target_input_path: PathBuf,
     pub target_output_path: PathBuf,
@@ -109,15 +108,45 @@ pub async fn run_code_package_obfuscation(
     task_dir: &Path,
     seed: Option<u64>,
 ) -> Result<ObfuscationResult, String> {
-    let main_repo_path = main_repo_path.to_path_buf();
-    let code_repo_path = code_repo_path.to_path_buf();
-    let task_dir = task_dir.to_path_buf();
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let output = crate::process::Command::new(executable)
+        .arg("--obfuscation-worker")
+        .arg(main_repo_path)
+        .arg(code_repo_path)
+        .arg(task_dir)
+        .arg(seed.map(|value| value.to_string()).unwrap_or_default())
+        .output()
+        .await
+        .map_err(|error| format!("执行混淆任务失败: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(text.lines().last().unwrap_or_default())
+        .map_err(|error| format!("混淆结果无效: {error}"))
+}
 
-    task::spawn_blocking(move || {
-        run_code_package_obfuscation_blocking(&main_repo_path, &code_repo_path, &task_dir, seed)
-    })
-    .await
-    .map_err(|error| format!("执行混淆任务失败: {error}"))?
+pub(crate) fn worker(args: &[std::ffi::OsString]) -> Result<(), String> {
+    if args.len() != 4 {
+        return Err("混淆工作进程参数无效".to_owned());
+    }
+    let seed = args[3]
+        .to_str()
+        .filter(|value| !value.is_empty())
+        .map(str::parse::<u64>)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let result = run_code_package_obfuscation_blocking(
+        Path::new(&args[0]),
+        Path::new(&args[1]),
+        Path::new(&args[2]),
+        seed,
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string(&result).map_err(|error| error.to_string())?
+    );
+    Ok(())
 }
 
 fn run_code_package_obfuscation_blocking(

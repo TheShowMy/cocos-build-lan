@@ -1,3 +1,4 @@
+use crate::process::Command;
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
@@ -7,7 +8,6 @@ use std::{
 use tokio::{
     fs::File,
     io::{AsyncBufReadExt, BufReader},
-    process::Command,
     sync::{mpsc, watch},
     task::JoinHandle,
     time::sleep,
@@ -275,25 +275,12 @@ async fn execute_cocos_build_with_watchdog(
 /// 终止构建子进程：Windows 下连进程树一起杀（防止孙进程持有输出管道导致排空卡死），
 /// 非 Windows 回退为直接终止；所有等待都带超时，保证取消/失败路径能尽快返回。
 async fn terminate_build_child(
-    child: &mut tokio::process::Child,
+    child: &mut crate::process::Child,
     stdout_handle: JoinHandle<()>,
     stderr_handle: JoinHandle<()>,
 ) {
-    #[cfg(windows)]
-    {
-        if let Some(pid) = child.id() {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .status()
-                .await;
-        } else {
-            let _ = child.start_kill();
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = child.start_kill();
-    }
+    child.terminate();
+    let _ = child.start_kill();
     let _ = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
     let _ = tokio::time::timeout(Duration::from_secs(10), stdout_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(10), stderr_handle).await;
@@ -455,7 +442,7 @@ fn executable_arch_text(path: &Path) -> String {
     }
 }
 
-fn resolve_creator_executable(engine_path: &str) -> Result<PathBuf, AppError> {
+pub(crate) fn resolve_creator_executable(engine_path: &str) -> Result<PathBuf, AppError> {
     let path = PathBuf::from(engine_path);
     let executable =
         if cfg!(target_os = "macos") && path.extension().is_some_and(|ext| ext == "app") {

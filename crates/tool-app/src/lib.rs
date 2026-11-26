@@ -1,6 +1,8 @@
 mod api;
 mod models;
+mod package_ui;
 mod pages;
+mod schemes;
 
 use dioxus::{document, prelude::*};
 use dioxus_free_icons::{
@@ -41,6 +43,7 @@ pub struct AppContext {
 
 #[derive(Clone, PartialEq)]
 pub struct Toast {
+    pub id: u64,
     pub message: String,
     pub error: bool,
 }
@@ -55,19 +58,84 @@ impl AppContext {
     }
 
     fn show(&mut self, message: String, error: bool) {
-        self.toast.set(Some(Toast { message, error }));
-        let mut toast = self.toast;
-        spawn(async move {
-            TimeoutFuture::new(3600).await;
-            toast.set(None);
-        });
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        self.toast.set(Some(Toast {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            message,
+            error,
+        }));
     }
 }
 
 #[component]
 pub fn App() -> Element {
+    let selected_group = use_signal(|| package_ui::read_storage::<String>("last-group", false));
+    let draft = use_signal(models::TaskGroup::default);
+    let baseline = use_signal(models::TaskGroup::default);
+    let saving = use_signal(|| false);
+    let pending = use_signal(|| None);
+    let revision = use_signal(|| 0);
+    let active_schemes = use_signal(|| {
+        package_ui::read_storage::<std::collections::BTreeMap<String, String>>(
+            "active-schemes",
+            false,
+        )
+    });
+    use_context_provider(|| schemes::ActiveSchemes(active_schemes));
+    use_effect(move || package_ui::write_storage("active-schemes", false, &active_schemes()));
+    let managing = use_signal(|| false);
+    let ui = package_ui::PackageUi {
+        active: active_schemes,
+        managing,
+        selected_group,
+        draft,
+        baseline,
+        saving,
+        pending,
+        revision,
+    };
+    use_context_provider(|| ui);
+    let owners = use_signal(|| {
+        package_ui::read_storage::<std::collections::BTreeMap<String, String>>(
+            "selected-tasks",
+            true,
+        )
+    });
+    let selected = use_signal(|| owners.peek().keys().cloned().collect::<Vec<_>>());
+    use_context_provider(|| package_ui::SelectedTasks(selected));
+    let saves = schemes::use_selection_saves(selected);
+    use_context_provider(|| package_ui::SelectionOwners(owners));
+    let branches = use_signal(|| {
+        package_ui::read_storage::<std::collections::BTreeMap<String, package_ui::BranchEntry>>(
+            "branches", false,
+        )
+    });
+    use_context_provider(|| package_ui::BranchCache(branches));
+    use_effect(move || package_ui::write_storage("last-group", false, &selected_group()));
+    use_effect(move || package_ui::write_storage("branches", false, &branches()));
+    use_effect(move || {
+        let dirty = ui.dirty() || saves.pending() || managing();
+        spawn(async move {
+            let _ = document::eval(&format!("window.__cocosUnsaved = {dirty}; if (!window.__cocosBeforeUnload) {{ window.__cocosBeforeUnload = event => {{ if (window.__cocosUnsaved) {{ event.preventDefault(); event.returnValue = ''; }} }}; window.addEventListener('beforeunload', window.__cocosBeforeUnload); }}")).await;
+        });
+    });
     let mut dark = use_signal(|| false);
-    let toast = use_signal(|| None::<Toast>);
+    let mut toast = use_signal(|| None::<Toast>);
+    use_effect(move || {
+        if let Some(message) = toast() {
+            spawn(async move {
+                TimeoutFuture::new(3600).await;
+                if toast
+                    .peek()
+                    .as_ref()
+                    .is_some_and(|current| current.id == message.id)
+                {
+                    toast.set(None);
+                }
+            });
+        }
+    });
     use_context_provider(|| AppContext { dark, toast });
     use_effect(move || {
         spawn(async move {
@@ -84,7 +152,16 @@ pub fn App() -> Element {
     rsx! {
         document::Link { rel: "stylesheet", href: APP_CSS }
         document::Script { src: EDITOR_JS }
-        Router::<Route> {}
+        document::Link { rel: "icon", r#type: "image/svg+xml", href: asset!("/assets/favicon.svg") }
+        Router::<Route> { config: move || RouterConfig::default().on_update(move |router| {
+            let next = router.current();
+            if next != (Route::Package {}) && managing() { return Some(Route::Package {}.into()); }
+            if next != (Route::Package {}) && ui.dirty() {
+                let mut pending = ui.pending;
+                pending.set(Some(package_ui::Destination::Page(next)));
+                Some(Route::Package {}.into())
+            } else { None }
+        }) }
     }
 }
 
@@ -129,6 +206,7 @@ fn Shell() -> Element {
                 div { class: if toast.error { "toast toast--visible toast--error" } else { "toast toast--visible" }, role: "status", "{toast.message}" }
             }
             Outlet::<Route> {}
+            package_ui::UnsavedDialog {}
         }
     }
 }

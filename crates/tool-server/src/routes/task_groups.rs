@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use axum::{
     Json, Router,
     extract::{Path, State},
-    routing::{get, put},
+    routing::{get, post, put},
 };
 use serde_json::Value;
 
@@ -20,6 +20,27 @@ use crate::{
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
+            "/api/task-groups/{group_id}/schemes/manage",
+            put(manage_schemes),
+        )
+        .route(
+            "/api/task-groups/{group_id}/schemes/{scheme_id}/tasks",
+            put(save_scheme_tasks),
+        )
+        .route("/api/task-groups/{group_id}/schemes", post(create_scheme))
+        .route(
+            "/api/task-groups/{group_id}/schemes/{scheme_id}/name",
+            put(rename_scheme),
+        )
+        .route(
+            "/api/task-groups/{group_id}/schemes/{scheme_id}",
+            put(save_scheme).delete(delete_scheme),
+        )
+        .route(
+            "/api/task-groups/{group_id}/schemes/{scheme_id}/apply",
+            post(apply_scheme),
+        )
+        .route(
             "/api/task-groups",
             get(list_task_groups).post(create_task_group),
         )
@@ -33,6 +54,319 @@ pub fn router() -> Router<AppState> {
         )
 }
 
+fn scheme_group<'a>(
+    settings: &'a mut crate::models::AppSettings,
+    id: &str,
+) -> Result<&'a mut TaskGroup, AppError> {
+    settings
+        .task_groups
+        .iter_mut()
+        .find(|g| g.id == id)
+        .ok_or_else(|| AppError::not_found("任务组不存在"))
+}
+
+fn prepare_scheme(
+    settings: &crate::models::AppSettings,
+    group_id: &str,
+    mut scheme: crate::models::BuildScheme,
+    current_id: Option<&str>,
+) -> Result<crate::models::BuildScheme, AppError> {
+    let group = settings
+        .task_groups
+        .iter()
+        .find(|g| g.id == group_id)
+        .ok_or_else(|| AppError::not_found("任务组不存在"))?;
+    let schemes = group.schemes.as_deref().unwrap_or_default();
+    if current_id.is_none() && schemes.len() >= 5 {
+        return Err(AppError::validation("每个任务组最多保存 5 个构建方案"));
+    }
+    if let Some(id) = current_id {
+        if !schemes.iter().any(|s| s.id == id) {
+            return Err(AppError::not_found("构建方案不存在"));
+        }
+        scheme.id = id.to_owned();
+    } else {
+        scheme.id = format!("scheme_{}", uuid::Uuid::new_v4().simple());
+    }
+    scheme.name = scheme.name.trim().to_owned();
+    if scheme.name.is_empty() {
+        return Err(AppError::validation("方案名称不能为空"));
+    }
+    if schemes.iter().any(|s| {
+        Some(s.id.as_str()) != current_id && s.name.to_lowercase() == scheme.name.to_lowercase()
+    }) {
+        return Err(AppError::validation("方案名称不能重复（忽略大小写）"));
+    }
+    scheme.branch = scheme.branch.trim().to_owned();
+    if scheme.branch.is_empty() {
+        return Err(AppError::validation("分支不能为空"));
+    }
+    scheme.params = normalize_params(&settings.param_definitions, scheme.params)?;
+    let mut seen = HashSet::new();
+    for id in &scheme.task_ids {
+        if !settings
+            .package_tasks
+            .iter()
+            .any(|task| task.id == *id && task.task_group_id == group_id)
+        {
+            return Err(AppError::validation(format!(
+                "任务 {id} 不属于当前组或已删除"
+            )));
+        }
+    }
+    scheme.task_ids.retain(|id| seen.insert(id.clone()));
+    Ok(scheme)
+}
+
+fn apply_scheme_values(
+    settings: &mut crate::models::AppSettings,
+    group_id: &str,
+    scheme: &crate::models::BuildScheme,
+) -> Result<(), AppError> {
+    let group = scheme_group(settings, group_id)?;
+    group.branch = scheme.branch.clone();
+    group.params = scheme.params.clone();
+    let project_id = group.project_id.clone();
+    for task in settings
+        .package_tasks
+        .iter_mut()
+        .filter(|t| t.task_group_id == group_id)
+    {
+        task.project = Some(crate::models::TaskProjectConfig {
+            project_id: project_id.clone(),
+            branch: scheme.branch.clone(),
+        });
+    }
+    Ok(())
+}
+
+async fn store_scheme(
+    state: AppState,
+    group_id: String,
+    current_id: Option<String>,
+    scheme: crate::models::BuildScheme,
+) -> Result<Json<TaskGroup>, AppError> {
+    let _edit = state.settings_edit.lock().await;
+    let _queue = state.idle_queue().await?;
+    let mut settings = state.get_settings().await;
+    let scheme = prepare_scheme(&settings, &group_id, scheme, current_id.as_deref())?;
+    let schemes = scheme_group(&mut settings, &group_id)?
+        .schemes
+        .get_or_insert_with(Vec::new);
+    if let Some(index) = schemes.iter().position(|s| s.id == scheme.id) {
+        schemes[index] = scheme.clone();
+    } else {
+        schemes.push(scheme.clone());
+    }
+    apply_scheme_values(&mut settings, &group_id, &scheme)?;
+    state.save_settings(settings).await?;
+    Ok(Json(state.find_task_group(&group_id).await?))
+}
+async fn create_scheme(
+    State(state): State<AppState>,
+    Path(group_id): Path<String>,
+    Json(scheme): Json<crate::models::BuildScheme>,
+) -> Result<Json<TaskGroup>, AppError> {
+    store_scheme(state, group_id, None, scheme).await
+}
+async fn save_scheme(
+    State(state): State<AppState>,
+    Path((group_id, scheme_id)): Path<(String, String)>,
+    Json(scheme): Json<crate::models::BuildScheme>,
+) -> Result<Json<TaskGroup>, AppError> {
+    store_scheme(state, group_id, Some(scheme_id), scheme).await
+}
+async fn delete_scheme(
+    State(state): State<AppState>,
+    Path((group_id, scheme_id)): Path<(String, String)>,
+) -> Result<Json<TaskGroup>, AppError> {
+    let _edit = state.settings_edit.lock().await;
+    let _queue = state.idle_queue().await?;
+    let mut settings = state.get_settings().await;
+    let schemes = scheme_group(&mut settings, &group_id)?
+        .schemes
+        .get_or_insert_with(Vec::new);
+    if !schemes.iter().any(|s| s.id == scheme_id) {
+        return Err(AppError::not_found("构建方案不存在"));
+    }
+    if schemes.len() <= 1 {
+        return Err(AppError::validation("至少保留一个构建方案"));
+    }
+    schemes.retain(|s| s.id != scheme_id);
+    state.save_settings(settings).await?;
+    Ok(Json(state.find_task_group(&group_id).await?))
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemeName {
+    name: String,
+}
+async fn rename_scheme(
+    State(state): State<AppState>,
+    Path((group_id, scheme_id)): Path<(String, String)>,
+    Json(request): Json<SchemeName>,
+) -> Result<Json<TaskGroup>, AppError> {
+    let _edit = state.settings_edit.lock().await;
+    let _queue = state.idle_queue().await?;
+    let mut settings = state.get_settings().await;
+    let schemes = scheme_group(&mut settings, &group_id)?
+        .schemes
+        .get_or_insert_with(Vec::new);
+    let name = request.name.trim().to_owned();
+    if name.is_empty()
+        || schemes
+            .iter()
+            .any(|s| s.id != scheme_id && s.name.to_lowercase() == name.to_lowercase())
+    {
+        return Err(AppError::validation("方案名称不能为空或重复（忽略大小写）"));
+    }
+    let scheme = schemes
+        .iter_mut()
+        .find(|s| s.id == scheme_id)
+        .ok_or_else(|| AppError::not_found("构建方案不存在"))?;
+    scheme.name = name;
+    state.save_settings(settings).await?;
+    Ok(Json(state.find_task_group(&group_id).await?))
+}
+
+async fn apply_scheme(
+    State(state): State<AppState>,
+    Path((group_id, scheme_id)): Path<(String, String)>,
+) -> Result<Json<crate::models::SchemeApplied>, AppError> {
+    let _edit = state.settings_edit.lock().await;
+    let _queue = state.idle_queue().await?;
+    let mut settings = state.get_settings().await;
+    let scheme = scheme_group(&mut settings, &group_id)?
+        .schemes
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .find(|s| s.id == scheme_id)
+        .cloned()
+        .ok_or_else(|| AppError::not_found("构建方案不存在"))?;
+    let scheme = prepare_scheme(&settings, &group_id, scheme, Some(&scheme_id))?;
+    apply_scheme_values(&mut settings, &group_id, &scheme)?;
+    state.save_settings(settings).await?;
+    Ok(Json(crate::models::SchemeApplied {
+        group: state.find_task_group(&group_id).await?,
+        scheme_id,
+        task_ids: scheme.task_ids,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SchemeTasks {
+    task_ids: Vec<String>,
+}
+
+async fn save_scheme_tasks(
+    State(state): State<AppState>,
+    Path((group_id, scheme_id)): Path<(String, String)>,
+    Json(request): Json<SchemeTasks>,
+) -> Result<Json<Vec<String>>, AppError> {
+    let _edit = state.settings_edit.lock().await;
+    let mut settings = state.get_settings().await;
+    let mut ids = request.task_ids;
+    if ids.iter().any(|id| {
+        !settings
+            .package_tasks
+            .iter()
+            .any(|t| t.id == *id && t.task_group_id == group_id)
+    }) {
+        return Err(AppError::validation("勾选任务必须属于当前任务组"));
+    }
+    let mut seen = HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+    let scheme = scheme_group(&mut settings, &group_id)?
+        .schemes
+        .iter_mut()
+        .flatten()
+        .find(|s| s.id == scheme_id)
+        .ok_or_else(|| AppError::not_found("构建方案不存在"))?;
+    scheme.task_ids = ids.clone();
+    state.save_settings(settings).await?;
+    Ok(Json(ids))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SchemeManagement {
+    #[serde(default)]
+    template: Option<crate::models::BuildScheme>,
+    current_id: String,
+    schemes: Vec<SchemeEntry>,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemeEntry {
+    id: Option<String>,
+    name: String,
+}
+
+async fn manage_schemes(
+    State(state): State<AppState>,
+    Path(group_id): Path<String>,
+    Json(request): Json<SchemeManagement>,
+) -> Result<Json<crate::models::SchemeApplied>, AppError> {
+    let _edit = state.settings_edit.lock().await;
+    let _queue = state.idle_queue().await?;
+    let mut settings = state.get_settings().await;
+    if !(1..=5).contains(&request.schemes.len()) {
+        return Err(AppError::validation("每组必须保留 1～5 个方案"));
+    }
+    let group = scheme_group(&mut settings, &group_id)?;
+    let old = group.schemes.clone().unwrap_or_default();
+    let source = old
+        .iter()
+        .find(|s| s.id == request.current_id)
+        .ok_or_else(|| AppError::not_found("当前构建方案不存在"))?
+        .clone();
+    let template = if let Some(mut template) = request.template {
+        template.name = source.name.clone();
+        prepare_scheme(&settings, &group_id, template, Some(&source.id))?
+    } else {
+        source.clone()
+    };
+    let mut ids = HashSet::new();
+    let mut names = HashSet::new();
+    let mut schemes = Vec::new();
+    for entry in request.schemes {
+        let name = entry.name.trim().to_owned();
+        if name.is_empty() || !names.insert(name.to_lowercase()) {
+            return Err(AppError::validation("方案名称不能为空或重复（忽略大小写）"));
+        }
+        let mut scheme = if let Some(id) = entry.id {
+            if !ids.insert(id.clone()) {
+                return Err(AppError::validation("方案 ID 重复"));
+            }
+            old.iter()
+                .find(|s| s.id == id)
+                .ok_or_else(|| AppError::not_found("构建方案不存在"))?
+                .clone()
+        } else {
+            let mut new = template.clone();
+            new.id = format!("scheme_{}", uuid::Uuid::new_v4().simple());
+            new
+        };
+        scheme.name = name;
+        schemes.push(scheme);
+    }
+    let active = schemes
+        .iter()
+        .find(|s| s.id == request.current_id)
+        .unwrap_or(&schemes[0])
+        .clone();
+    scheme_group(&mut settings, &group_id)?.schemes = Some(schemes);
+    apply_scheme_values(&mut settings, &group_id, &active)?;
+    state.save_settings(settings).await?;
+    Ok(Json(crate::models::SchemeApplied {
+        group: state.find_task_group(&group_id).await?,
+        scheme_id: active.id,
+        task_ids: active.task_ids,
+    }))
+}
+
 async fn list_task_groups(State(state): State<AppState>) -> Json<Vec<TaskGroup>> {
     let mut groups = state.get_settings().await.task_groups;
     groups.sort_by_key(|group| group.order);
@@ -43,6 +377,7 @@ async fn create_task_group(
     State(state): State<AppState>,
     Json(request): Json<TaskGroupRequest>,
 ) -> Result<Json<TaskGroup>, AppError> {
+    let _edit = state.settings_edit.lock().await;
     validate_group_request(&state, &request, None).await?;
     let mut settings = state.get_settings().await;
     let order = settings
@@ -73,6 +408,7 @@ async fn create_task_group(
         description: request.description.trim().to_owned(),
         branch: request.branch.trim().to_owned(),
         params: normalize_params(&settings.param_definitions, params)?,
+        schemes: None,
         presets: normalize_presets(
             &settings.param_definitions,
             request.presets.unwrap_or_default(),
@@ -84,8 +420,9 @@ async fn create_task_group(
         order,
     };
     settings.task_groups.push(group.clone());
+    let id = group.id.clone();
     state.save_settings(settings).await?;
-    Ok(Json(group))
+    Ok(Json(state.find_task_group(&id).await?))
 }
 
 async fn update_task_group(
@@ -93,6 +430,7 @@ async fn update_task_group(
     Path(group_id): Path<String>,
     Json(request): Json<TaskGroupRequest>,
 ) -> Result<Json<TaskGroup>, AppError> {
+    let _edit = state.settings_edit.lock().await;
     validate_group_request(&state, &request, Some(&group_id)).await?;
     let mut settings = state.get_settings().await;
     let definitions = settings.param_definitions.clone();
@@ -133,6 +471,8 @@ async fn update_task_group_params(
     Path(group_id): Path<String>,
     Json(request): Json<TaskGroupParamsRequest>,
 ) -> Result<Json<TaskGroup>, AppError> {
+    let _edit = state.settings_edit.lock().await;
+    let _queue = state.idle_queue().await?;
     if request.branch.trim().is_empty() {
         return Err(AppError::validation("任务组分支不能为空"));
     }
@@ -145,6 +485,16 @@ async fn update_task_group_params(
         .ok_or_else(|| AppError::not_found(format!("未找到任务组 {group_id}")))?;
     group.branch = request.branch.trim().to_owned();
     group.params = normalize_params(&definitions, request.params)?;
+    if let Some(id) = request.scheme_id {
+        let scheme = group
+            .schemes
+            .iter_mut()
+            .flatten()
+            .find(|s| s.id == id)
+            .ok_or_else(|| AppError::not_found("构建方案不存在"))?;
+        scheme.branch = group.branch.clone();
+        scheme.params = group.params.clone();
+    }
     let result = group.clone();
     for task in settings
         .package_tasks
@@ -189,6 +539,7 @@ async fn delete_task_group(
     for task_id in task_ids {
         crate::services::package_tasks::delete_task(&state, &task_id).await?;
     }
+    let _edit = state.settings_edit.lock().await;
     let mut settings = state.get_settings().await;
     settings.task_groups.retain(|group| group.id != group_id);
     state.save_settings(settings).await?;
@@ -223,7 +574,7 @@ async fn validate_group_request(
     Ok(())
 }
 
-fn normalize_params(
+pub(crate) fn normalize_params(
     definitions: &[ParamDefinition],
     params: BTreeMap<String, Value>,
 ) -> Result<BTreeMap<String, Value>, AppError> {
@@ -251,7 +602,23 @@ fn normalize_params(
     Ok(normalized)
 }
 
-fn check_param_kind(definition: &ParamDefinition, value: &mut Value) -> Result<(), AppError> {
+pub(crate) fn check_param_kind(
+    definition: &ParamDefinition,
+    value: &mut Value,
+) -> Result<(), AppError> {
+    crate::services::parameters::normalize_identifier(definition, value)?;
+    if definition.required && is_empty(value) {
+        return Err(AppError::validation(format!(
+            "参数 {} 不能为空",
+            definition.key
+        )));
+    }
+    if definition.kind == ParamKind::Text && !value.is_string() && !value.is_null() {
+        return Err(AppError::validation(format!(
+            "参数 {} 必须是文本",
+            definition.key
+        )));
+    }
     if definition.kind == ParamKind::Number {
         normalize_integral_number(value);
         if !value.is_number() {
@@ -360,6 +727,450 @@ mod tests {
 
     use super::*;
     use crate::models::{AppSettings, GroupParamPreset, PackageTask, Project};
+
+    async fn scheme_fixture() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::load(dir.path().to_path_buf()).await;
+        state
+            .save_settings(AppSettings {
+                projects: vec![Project {
+                    id: "p".into(),
+                    name: "P".into(),
+                    workspace_dir_key: "p".into(),
+                    ..Default::default()
+                }],
+                task_groups: vec![
+                    TaskGroup {
+                        id: "g".into(),
+                        project_id: "p".into(),
+                        branch: "main".into(),
+                        name: "G".into(),
+                        ..Default::default()
+                    },
+                    TaskGroup {
+                        id: "other".into(),
+                        project_id: "p".into(),
+                        branch: "main".into(),
+                        name: "Other".into(),
+                        ..Default::default()
+                    },
+                ],
+                package_tasks: vec![
+                    PackageTask {
+                        id: "t".into(),
+                        task_group_id: "g".into(),
+                        ..Default::default()
+                    },
+                    PackageTask {
+                        id: "foreign".into(),
+                        task_group_id: "other".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        (dir, state)
+    }
+    fn snapshot(name: &str) -> crate::models::BuildScheme {
+        crate::models::BuildScheme {
+            name: name.into(),
+            branch: "release".into(),
+            params: BTreeMap::from([("version".into(), serde_json::json!("01.2.3"))]),
+            task_ids: vec!["t".into()],
+            ..Default::default()
+        }
+    }
+    #[tokio::test]
+    async fn scheme_limits_names_and_deleted_defaults_persist() {
+        let (dir, state) = scheme_fixture().await;
+        let group = state.find_task_group("g").await.unwrap();
+        let defaults = group.schemes.unwrap();
+        assert_eq!(
+            defaults.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["pro", "test"]
+        );
+        assert!(defaults.iter().all(|s| s.task_ids.is_empty()));
+        assert!(
+            store_scheme(state.clone(), "g".into(), None, snapshot(" PRO "))
+                .await
+                .is_err()
+        );
+        for name in ["a", "b", "c"] {
+            let _ = store_scheme(state.clone(), "g".into(), None, snapshot(name))
+                .await
+                .unwrap();
+        }
+        assert!(
+            store_scheme(state.clone(), "g".into(), None, snapshot("d"))
+                .await
+                .is_err()
+        );
+        let group = state.find_task_group("g").await.unwrap();
+        for scheme in group.schemes.unwrap().into_iter().take(4) {
+            let _ = delete_scheme(State(state.clone()), Path(("g".into(), scheme.id)))
+                .await
+                .unwrap();
+        }
+        let reloaded = AppState::load(dir.path().to_path_buf()).await;
+        let remaining = reloaded
+            .find_task_group("g")
+            .await
+            .unwrap()
+            .schemes
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "c");
+        assert!(
+            delete_scheme(
+                State(reloaded.clone()),
+                Path(("g".into(), remaining[0].id.clone()))
+            )
+            .await
+            .is_err()
+        );
+        let _ = store_scheme(reloaded, "g".into(), None, snapshot("new"))
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn schemes_validate_atomically_apply_and_clean_moved_tasks() {
+        let (_dir, state) = scheme_fixture().await;
+        let original = state.find_task_group("g").await.unwrap();
+        for invalid in [
+            crate::models::BuildScheme {
+                task_ids: vec!["foreign".into()],
+                ..snapshot("bad")
+            },
+            crate::models::BuildScheme {
+                params: BTreeMap::from([("version".into(), serde_json::json!("1..2"))]),
+                ..snapshot("bad")
+            },
+        ] {
+            assert!(
+                store_scheme(state.clone(), "g".into(), None, invalid)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(state.find_task_group("g").await.unwrap(), original);
+        }
+        let saved = store_scheme(state.clone(), "g".into(), None, snapshot("new"))
+            .await
+            .unwrap()
+            .0;
+        let scheme = saved
+            .schemes
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "new")
+            .unwrap();
+        let applied = apply_scheme(State(state.clone()), Path(("g".into(), scheme.id.clone())))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(applied.task_ids, vec!["t"]);
+        assert_eq!(applied.group.params["version"], "01.2.3");
+        state.try_start_build().await.unwrap();
+        assert!(
+            apply_scheme(State(state.clone()), Path(("g".into(), scheme.id.clone())))
+                .await
+                .is_err()
+        );
+        assert_eq!(state.find_task_group("g").await.unwrap(), applied.group);
+        state.finish_build().await;
+        let mut settings = state.get_settings().await;
+        settings
+            .package_tasks
+            .iter_mut()
+            .find(|t| t.id == "t")
+            .unwrap()
+            .task_group_id = "other".into();
+        state.save_settings(settings).await.unwrap();
+        let group = state.find_task_group("g").await.unwrap();
+        assert!(group.schemes.unwrap().iter().all(|s| s.task_ids.is_empty()));
+    }
+    #[tokio::test]
+    async fn scheme_disk_failure_leaves_group_and_scheme_unchanged() {
+        let (dir, state) = scheme_fixture().await;
+        let original = state.find_task_group("g").await.unwrap();
+        let path = dir.path().join("settings.json");
+        tokio::fs::remove_file(&path).await.unwrap();
+        tokio::fs::create_dir(&path).await.unwrap();
+        assert!(
+            store_scheme(state.clone(), "g".into(), None, snapshot("new"))
+                .await
+                .is_err()
+        );
+        assert_eq!(state.find_task_group("g").await.unwrap(), original);
+        let id = original.schemes.unwrap()[0].id.clone();
+        assert!(
+            apply_scheme(State(state.clone()), Path(("g".into(), id)))
+                .await
+                .is_err()
+        );
+        assert_eq!(state.find_task_group("g").await.unwrap().branch, "main");
+    }
+
+    #[tokio::test]
+    async fn selection_only_save_is_queue_safe_and_rejects_foreign_tasks() {
+        let (_dir, state) = scheme_fixture().await;
+        let original = state.find_task_group("g").await.unwrap();
+        let id = original.schemes.as_ref().unwrap()[0].id.clone();
+        state.try_start_build().await.unwrap();
+        let _ = save_scheme_tasks(
+            State(state.clone()),
+            Path(("g".into(), id.clone())),
+            Json(SchemeTasks {
+                task_ids: vec!["t".into(), "t".into()],
+            }),
+        )
+        .await
+        .unwrap();
+        let saved = state.find_task_group("g").await.unwrap();
+        assert_eq!(saved.params, original.params);
+        assert_eq!(saved.branch, original.branch);
+        assert_eq!(
+            saved.schemes.as_ref().unwrap()[0].params,
+            original.schemes.as_ref().unwrap()[0].params
+        );
+        assert_eq!(saved.schemes.as_ref().unwrap()[0].task_ids, vec!["t"]);
+        assert!(state.is_build_in_progress().await);
+        assert!(
+            save_scheme_tasks(
+                State(state.clone()),
+                Path(("g".into(), id)),
+                Json(SchemeTasks {
+                    task_ids: vec!["foreign".into()]
+                })
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(state.find_task_group("g").await.unwrap(), saved);
+        state.finish_build().await;
+    }
+
+    #[tokio::test]
+    async fn parameters_update_scheme_atomically_without_changing_selection() {
+        let (_dir, state) = scheme_fixture().await;
+        let original = state.find_task_group("g").await.unwrap();
+        let id = original.schemes.as_ref().unwrap()[0].id.clone();
+        for (scheme_id, version) in [(id.clone(), "bad"), ("missing".into(), "2.3")] {
+            assert!(
+                update_task_group_params(
+                    State(state.clone()),
+                    Path("g".into()),
+                    Json(TaskGroupParamsRequest {
+                        scheme_id: Some(scheme_id),
+                        branch: "test".into(),
+                        params: BTreeMap::from([("version".into(), serde_json::json!(version))])
+                    })
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(state.find_task_group("g").await.unwrap(), original);
+        }
+        let saved = update_task_group_params(
+            State(state.clone()),
+            Path("g".into()),
+            Json(TaskGroupParamsRequest {
+                scheme_id: Some(id),
+                branch: "test".into(),
+                params: BTreeMap::from([("version".into(), serde_json::json!("02.3"))]),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let scheme = &saved.schemes.as_ref().unwrap()[0];
+        assert_eq!(saved.params, scheme.params);
+        assert_eq!(saved.branch, scheme.branch);
+        assert!(scheme.task_ids.is_empty());
+        assert_eq!(
+            saved.schemes.as_ref().unwrap()[1],
+            original.schemes.as_ref().unwrap()[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn management_preserves_snapshots_and_applies_active_replacement() {
+        let (_dir, state) = scheme_fixture().await;
+        let original = state.find_task_group("g").await.unwrap();
+        let schemes = original.schemes.clone().unwrap();
+        let first = schemes[0].id.clone();
+        for entries in [
+            vec![],
+            vec![
+                SchemeEntry {
+                    id: Some(first.clone()),
+                    name: "x".into(),
+                },
+                SchemeEntry {
+                    id: None,
+                    name: " X ".into(),
+                },
+            ],
+            (0..6)
+                .map(|i| SchemeEntry {
+                    id: None,
+                    name: i.to_string(),
+                })
+                .collect(),
+        ] {
+            assert!(
+                manage_schemes(
+                    State(state.clone()),
+                    Path("g".into()),
+                    Json(SchemeManagement {
+                        template: None,
+                        current_id: first.clone(),
+                        schemes: entries
+                    })
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(state.find_task_group("g").await.unwrap(), original);
+        }
+        let _ = save_scheme_tasks(
+            State(state.clone()),
+            Path(("g".into(), first.clone())),
+            Json(SchemeTasks {
+                task_ids: vec!["t".into()],
+            }),
+        )
+        .await
+        .unwrap();
+        let saved = manage_schemes(
+            State(state.clone()),
+            Path("g".into()),
+            Json(SchemeManagement {
+                template: Some(snapshot("ignored")),
+                current_id: first.clone(),
+                schemes: vec![
+                    SchemeEntry {
+                        id: Some(first.clone()),
+                        name: " renamed ".into(),
+                    },
+                    SchemeEntry {
+                        id: None,
+                        name: "new".into(),
+                    },
+                ],
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(saved.scheme_id, first);
+        let list = saved.group.schemes.unwrap();
+        assert_eq!(list[0].name, "renamed");
+        assert_eq!(list[0].task_ids, vec!["t"]);
+        assert_eq!(list[0].params, schemes[0].params);
+        assert_eq!(list[1].task_ids, vec!["t"]);
+        assert_eq!(list[1].params["version"], "01.2.3");
+        assert_eq!(list[1].branch, "release");
+        let replacement = manage_schemes(
+            State(state.clone()),
+            Path("g".into()),
+            Json(SchemeManagement {
+                template: None,
+                current_id: first,
+                schemes: vec![SchemeEntry {
+                    id: Some(list[1].id.clone()),
+                    name: "new".into(),
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(replacement.scheme_id, list[1].id);
+        assert_eq!(replacement.task_ids, vec!["t"]);
+        assert_eq!(replacement.group.params, list[1].params);
+        state.try_start_build().await.unwrap();
+        assert!(
+            manage_schemes(
+                State(state.clone()),
+                Path("g".into()),
+                Json(SchemeManagement {
+                    template: None,
+                    current_id: replacement.scheme_id.clone(),
+                    schemes: vec![SchemeEntry {
+                        id: Some(replacement.scheme_id),
+                        name: "blocked".into()
+                    }]
+                })
+            )
+            .await
+            .is_err()
+        );
+        state.finish_build().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_empty_schemes_create_only_pro_and_new_writes_are_atomic() {
+        let (dir, state) = scheme_fixture().await;
+        let mut settings = state.get_settings().await;
+        settings
+            .task_groups
+            .iter_mut()
+            .find(|g| g.id == "g")
+            .unwrap()
+            .schemes = Some(vec![]);
+        state.save_settings(settings).await.unwrap();
+        let group = state.find_task_group("g").await.unwrap();
+        let schemes = group.schemes.as_ref().unwrap();
+        assert_eq!(schemes.len(), 1);
+        assert_eq!(schemes[0].name, "pro");
+        let path = dir.path().join("settings.json");
+        tokio::fs::remove_file(&path).await.unwrap();
+        tokio::fs::create_dir(&path).await.unwrap();
+        let id = schemes[0].id.clone();
+        assert!(
+            save_scheme_tasks(
+                State(state.clone()),
+                Path(("g".into(), id.clone())),
+                Json(SchemeTasks {
+                    task_ids: vec!["t".into()]
+                })
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            manage_schemes(
+                State(state.clone()),
+                Path("g".into()),
+                Json(SchemeManagement {
+                    template: None,
+                    current_id: id.clone(),
+                    schemes: vec![SchemeEntry {
+                        id: Some(id.clone()),
+                        name: "changed".into()
+                    }]
+                })
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            update_task_group_params(
+                State(state.clone()),
+                Path("g".into()),
+                Json(TaskGroupParamsRequest {
+                    scheme_id: Some(id),
+                    branch: "other".into(),
+                    params: group.params.clone()
+                })
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(state.find_task_group("g").await.unwrap(), group);
+    }
 
     #[test]
     fn parameter_validation_rejects_unknown_and_invalid_select_values() {
@@ -732,6 +1543,7 @@ mod tests {
                         "channel".to_owned(),
                         Value::String("copied".to_owned()),
                     )]),
+                    schemes: None,
                     presets: Vec::new(),
                     hidden_params: Vec::new(),
                     order: 0,

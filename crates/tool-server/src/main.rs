@@ -1,138 +1,294 @@
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-
-//! Cocos Build 的局域网服务端。
-//!
-//! 业务执行逻辑来自旧工具，但生命周期、数据根目录和更新协议由
-//! lan-toolkit 管理。浏览器端只访问公开 API；Git 凭据通过控制端的
-//! loopback API 管理，绝不包含在 `/api/settings` 响应中。
-
+//! npm entrypoint: one foreground process owns the web service, tasks and TUI.
 mod error;
 mod git;
+mod machine;
 mod models;
+mod process;
 mod routes;
 mod services;
 mod state;
+mod tui;
 
-use std::{
-    fs,
-    net::SocketAddr,
-    path::{Component, PathBuf},
-    sync::Arc,
-};
-
+use crate::state::AppState;
 use axum::{
-    Extension, Json, Router,
-    extract::{ConnectInfo, Request},
+    Extension, Router,
+    extract::{Request, State},
     http::{StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
 };
-use cocos_build_lan_contract::{ToolSettings, ToolStatus};
-use cocos_build_lan_core::{
-    ToolLaunchSpec, ToolRuntime, control_port_candidates, first_available_business_port,
+use cocos_build_lan_contract::ToolSettings;
+use cocos_build_lan_core::{ToolIdentity, ToolPaths, business_port_candidates};
+use fs2::FileExt;
+use std::{
+    fs,
+    io::{IsTerminal, Write},
+    net::{IpAddr, SocketAddr},
+    path::{Component, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
-use semver::Version;
-use tokio::sync::RwLock;
-use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tokio::sync::{Mutex, RwLock};
+use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt::time::ChronoLocal};
 
-use crate::state::AppState;
-
-#[derive(Clone)]
-pub(crate) struct ControlState {
-    pub settings: Arc<RwLock<ToolSettings>>,
-    pub settings_path: PathBuf,
-    pub app: AppState,
-    pub control_port: u16,
-    pub lan_port: u16,
+fn main() {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--obfuscation-worker")
+    {
+        if let Err(error) = services::obfuscation::worker(&args[1..]) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--version") {
+        println!("cocos-build-lan {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("创建运行时");
+    let result = runtime.block_on(run());
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    if let Err(error) = result {
+        eprintln!("启动/运行失败: {error}");
+        std::process::exit(1);
+    }
 }
 
-#[tokio::main]
-async fn main() {
-    init_tracing();
-    let server_binary = "cocos-build-lan-server";
-    let control_binary = "cocos-build-lan-control";
-    let spec = ToolLaunchSpec::discover(server_binary, control_binary)
-        .expect("需要从包含 tool.json 的生成项目目录启动服务端");
-    let control_port = resolve_control_port(spec.identity.tool_id).expect("选择本机控制端口");
-    let control_settings = load_control_settings(&spec.paths, spec.identity.tool_id, control_port)
-        .expect("读取控制端配置");
-    let lan_port = control_settings.network.lan_port;
-    let runtime = ToolRuntime::new(
-        spec.identity.clone(),
-        Version::parse(env!("CARGO_PKG_VERSION")).expect("有效版本"),
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let identity: ToolIdentity = serde_json::from_str(include_str!("../../../tool.json"))?;
+    let paths = ToolPaths::for_tool(identity.tool_id)?;
+    let mut lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(paths.root().join("instance.lock"))?;
+    if lock.try_lock_exclusive().is_err() {
+        let address = fs::read_to_string(paths.root().join("instance.json"))
+            .unwrap_or_else(|_| "实例正在启动，请稍后查看原终端".into());
+        println!("已有 cocos-build-lan 实例正在运行：{address}");
+        return Ok(());
+    }
+    lock.set_len(0)?;
+    writeln!(lock, "{}", std::process::id())?;
+    let mut settings: ToolSettings = if paths.config_file().exists() {
+        serde_json::from_slice(&fs::read(paths.config_file())?)?
+    } else {
+        ToolSettings::default()
+    };
+    if settings.network.lan_port == 0 {
+        settings.network.lan_port = business_port_candidates(identity.tool_id)
+            .into_iter()
+            .find(|port| std::net::TcpListener::bind(("0.0.0.0", *port)).is_ok())
+            .ok_or("没有可用的业务端口")?;
+    }
+    let port = settings.network.lan_port;
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+        .await
+        .map_err(|e| {
+            format!(
+                "无法监听端口 {port}：{e}。请确认旧实例已退出或修改 {}",
+                paths.config_file().display()
+            )
+        })?;
+    backup_before_npm(&paths)?;
+    // Persist the current schema only after preserving the original configuration.
+    machine::write_settings(&paths.config_file(), &settings)?;
+    let interactive = std::io::stdout().is_terminal()
+        && std::io::stdin().is_terminal()
+        && !std::env::args().any(|arg| arg == "--no-tui");
+    let sink = tui::LogSink::new(
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(paths.server_log())?,
+        interactive,
     );
-    let app_state = AppState::load_with_restart_registry(
-        spec.paths.root().join("data").join("cocos-build"),
-        runtime.restart_registry(),
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_timer(ChronoLocal::new("%Y-%m-%d %H:%M:%S".into()))
+        .with_ansi(false)
+        .with_writer(sink.clone())
+        .compact()
+        .init();
+    let ips: Vec<IpAddr> = local_ip_address::list_afinet_netifas()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, ip)| ip)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut urls = vec![format!("http://127.0.0.1:{port}")];
+    urls.extend(
+        ips.iter()
+            .filter(|ip| matches!(ip, IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() && !ip.is_link_local()))
+            .map(|ip| format!("http://{ip}:{port}")),
+    );
+    fs::write(
+        paths.root().join("instance.json"),
+        serde_json::to_vec(
+            &serde_json::json!({"pid": std::process::id(), "version": env!("CARGO_PKG_VERSION"), "urls": urls}),
+        )?,
+    )?;
+    let app = AppState::load(paths.root().join("data/cocos-build")).await;
+    app.set_git_config(settings.business.git_config().into())
+        .await?;
+    app.set_workspace_root(
+        (!settings.business.workspace_root.is_empty())
+            .then(|| PathBuf::from(&settings.business.workspace_root)),
     )
     .await;
-    app_state
-        .set_git_config(control_settings.business.git_config().into())
-        .await
-        .expect("同步控制端 Git 凭据");
-    app_state
-        .set_workspace_root(
-            (!control_settings.business.workspace_root.trim().is_empty())
-                .then(|| PathBuf::from(control_settings.business.workspace_root.trim())),
-        )
-        .await;
-
-    let control = ControlState {
-        settings: Arc::new(RwLock::new(control_settings)),
-        settings_path: spec.paths.config_file(),
-        app: app_state.clone(),
-        control_port,
-        lan_port,
+    let machine = machine::Machine {
+        app: app.clone(),
+        settings: Arc::new(RwLock::new(settings)),
+        path: paths.config_file(),
+        port,
+        ips,
+        urls: urls.clone(),
+        mutations: Arc::new(Mutex::new(())),
+        dialog: Arc::new(Mutex::new(())),
     };
     let web_root = resolve_web_root();
-    let public_router = public_router(app_state);
-    let public_router = if web_root.exists() {
-        public_router
-            .fallback(serve_web)
-            .layer(Extension(WebRoot(web_root.clone())))
+    let public = public_router(app.clone()).merge(machine::router(machine)).route("/healthz", get(move || async move { axum::Json(serde_json::json!({"toolId": identity.tool_id, "version": env!("CARGO_PKG_VERSION"), "status": "ok"})) })).fallback(serve_web).layer(Extension(WebRoot(web_root.clone())));
+    for url in &urls {
+        info!(%url, "访问地址");
+    }
+    info!(version = env!("CARGO_PKG_VERSION"), "服务已启动");
+    diagnose(&web_root).await;
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            public.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.changed().await;
+        })
+        .await
+    });
+    let ui_stop = Arc::new(AtomicBool::new(false));
+    let mut ui = if interactive {
+        let stop = ui_stop.clone();
+        Some(tokio::task::spawn_blocking(move || {
+            tui::run(urls, sink.logs, stop)
+        }))
     } else {
-        public_router.route(
-            "/",
-            get(|| async { "Cocos Build LAN 服务正在运行；请先构建 Web SPA。" }),
-        )
+        None
     };
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([
-            axum::http::Method::GET,
-            axum::http::Method::POST,
-            axum::http::Method::PUT,
-            axum::http::Method::DELETE,
-        ])
-        .allow_headers(Any);
-    let public_router = public_router.layer(cors);
-    let control_router = control_router(runtime.clone(), control);
-    let control_address = SocketAddr::from(([127, 0, 0, 1], control_port));
-    let lan_address = SocketAddr::from(([0, 0, 0, 0], lan_port));
-    let control_listener = tokio::net::TcpListener::bind(control_address)
-        .await
-        .expect("绑定本机控制端口");
-    let lan_listener = tokio::net::TcpListener::bind(lan_address)
-        .await
-        .expect("绑定局域网业务端口");
-    info!(control_address = %control_address, lan_address = %lan_address, web_root = %web_root.display(), "Cocos Build LAN 服务已启动");
-    let control_shutdown = runtime.clone();
-    let lan_shutdown = runtime;
-    tokio::try_join!(
-        axum::serve(
-            control_listener,
-            control_router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move { control_shutdown.wait_for_shutdown().await }),
-        axum::serve(
-            lan_listener,
-            public_router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move { lan_shutdown.wait_for_shutdown().await }),
+    tokio::select! {
+        result = &mut server => { ui_stop.store(true, Ordering::SeqCst); warn!(?result, "Web 服务已停止"); }
+        result = async { match &mut ui { Some(handle) => handle.await.map_err(|e| e.to_string())?.map_err(|e| e.to_string()), None => std::future::pending().await } } => { if let Err(error) = result { warn!(%error, "TUI 已停止"); } }
+        _ = termination_signal(interactive) => { ui_stop.store(true, Ordering::SeqCst); }
+    }
+    info!("正在停止全部任务并退出");
+    app.stop_all().await;
+    process::stop_all();
+    let _ = shutdown_tx.send(true);
+    let drained = tokio::time::timeout(
+        Duration::from_secs(10),
+        app.operations.clone().write_owned(),
     )
-    .expect("运行服务端监听器");
+    .await;
+    if drained.is_err() {
+        warn!("任务收尾超时，终止剩余请求");
+    }
+    server.abort();
+    process::stop_all();
+    app.finish_shutdown().await?;
+    ui_stop.store(true, Ordering::SeqCst);
+    if let Some(handle) = ui
+        && !handle.is_finished()
+    {
+        let _ = handle.await;
+    }
+    info!("全部任务已停止，服务已退出");
+    let _ = fs::remove_file(paths.root().join("instance.json"));
+    Ok(())
+}
+
+fn backup_before_npm(paths: &ToolPaths) -> std::io::Result<()> {
+    let backup = paths.root().join("backups/before-npm-0.2");
+    if backup.join("complete").exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(&backup)?;
+    for (source, name) in [
+        (paths.config_file(), "tool-settings.json"),
+        (
+            paths.root().join("data/cocos-build/settings.json"),
+            "settings.json",
+        ),
+        (
+            paths.root().join("data/cocos-build/runtime_state.json"),
+            "runtime_state.json",
+        ),
+    ] {
+        if source.is_file() && !backup.join(name).exists() {
+            fs::copy(source, backup.join(name))?;
+        }
+    }
+    fs::write(backup.join("complete"), b"0.2.0")?;
+    Ok(())
+}
+
+async fn termination_signal(interactive: bool) {
+    #[cfg(windows)]
+    {
+        let mut close = tokio::signal::windows::ctrl_close().expect("注册关闭通知");
+        let mut shutdown = tokio::signal::windows::ctrl_shutdown().expect("注册关机通知");
+        let mut ctrl_break = tokio::signal::windows::ctrl_break().expect("注册退出通知");
+        tokio::select! { _ = close.recv() => {}, _ = shutdown.recv() => {}, _ = ctrl_break.recv() => {}, _ = async { if interactive { std::future::pending::<()>().await } else { let _ = tokio::signal::ctrl_c().await; } } => {} }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = interactive;
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+async fn diagnose(web_root: &std::path::Path) {
+    for program in ["git", "uv", "node"] {
+        let executable = if program == "node" {
+            std::env::var_os("COCOS_BUILD_LAN_NODE_EXE").unwrap_or_else(|| program.into())
+        } else {
+            program.into()
+        };
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            process::Command::new(executable).arg("--version").output(),
+        )
+        .await
+        {
+            Ok(Ok(result)) if result.status.success() => {
+                info!(tool = program, version = %String::from_utf8_lossy(&result.stdout).trim(), "依赖检查通过")
+            }
+            _ => warn!(
+                tool = program,
+                "依赖缺失或不可运行，请安装并配置 PATH 后重试；相关任务暂不可用"
+            ),
+        }
+    }
+    if !web_root.join("index.html").is_file() {
+        warn!("Web 资源缺失，请重新构建或安装完整 npm 包");
+    }
+    let scripts = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.join("scripts/ast_obfuscate.cjs")));
+    if !scripts.is_some_and(|p| p.is_file()) {
+        warn!("混淆脚本缺失，请重新构建或安装完整 npm 包");
+    }
 }
 
 fn public_router(app: AppState) -> Router {
@@ -144,191 +300,19 @@ fn public_router(app: AppState) -> Router {
         .merge(routes::package_tasks::router())
         .merge(routes::preps::router())
         .merge(routes::task_groups::router())
+        .layer(middleware::from_fn_with_state(
+            app.clone(),
+            operation_request,
+        ))
         .with_state(app)
 }
-
-fn control_router(runtime: ToolRuntime, control: ControlState) -> Router {
-    runtime
-        .router()
-        .route("/api/control-status", get(control_status))
-        .route(
-            "/api/control-config",
-            get(control_config).put(save_control_config),
-        )
-        .route(
-            "/api/control/import/preview",
-            axum::routing::post(import_preview),
-        )
-        .route("/api/control/import", axum::routing::post(import_legacy))
-        .layer(Extension(control))
-}
-
-async fn control_status(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Extension(control): Extension<ControlState>,
-) -> Result<Json<ToolStatus>, crate::error::AppError> {
-    require_loopback(peer)?;
-    let status = control.app.control_status().await;
-    Ok(Json(status))
-}
-
-async fn control_config(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Extension(control): Extension<ControlState>,
-) -> Result<Json<ToolSettings>, crate::error::AppError> {
-    require_loopback(peer)?;
-    Ok(Json(control.settings.read().await.clone()))
-}
-
-async fn save_control_config(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Extension(control): Extension<ControlState>,
-    Json(settings): Json<ToolSettings>,
-) -> Result<Json<ToolSettings>, crate::error::AppError> {
-    require_loopback(peer)?;
-    validate_lan_port(&control, &settings)?;
-    write_control_settings(&control.settings_path, &settings)?;
-    control
-        .app
-        .set_git_config(settings.business.git_config().into())
-        .await?;
-    control
-        .app
-        .set_workspace_root(
-            (!settings.business.workspace_root.trim().is_empty())
-                .then(|| PathBuf::from(settings.business.workspace_root.trim())),
-        )
-        .await;
-    *control.settings.write().await = settings.clone();
-    Ok(Json(settings))
-}
-
-async fn import_preview(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Extension(control): Extension<ControlState>,
-    Json(request): Json<crate::models::LegacyImportRequest>,
-) -> Result<Json<crate::models::LegacyImportPreview>, crate::error::AppError> {
-    require_loopback(peer)?;
-    Ok(Json(
-        control
-            .app
-            .preview_legacy_import(PathBuf::from(request.data_dir))
-            .await?,
-    ))
-}
-
-async fn import_legacy(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Extension(control): Extension<ControlState>,
-    Json(request): Json<crate::models::LegacyImportRequest>,
-) -> Result<Json<crate::models::LegacyImportPreview>, crate::error::AppError> {
-    require_loopback(peer)?;
-    let (result, imported_git_config) = control
-        .app
-        .import_legacy(PathBuf::from(request.data_dir))
-        .await?;
-    let mut private = control.settings.read().await.clone();
-    private
-        .business
-        .set_git_config(cocos_build_lan_contract::GitConfig {
-            username: imported_git_config.username.clone(),
-            password: imported_git_config.password.clone(),
-        });
-    write_control_settings(&control.settings_path, &private)?;
-    control.app.set_git_config(imported_git_config).await?;
-    *control.settings.write().await = private;
-    Ok(Json(result))
-}
-
-fn require_loopback(peer: SocketAddr) -> Result<(), crate::error::AppError> {
-    if peer.ip().is_loopback() {
-        Ok(())
-    } else {
-        Err(crate::error::AppError::forbidden(
-            "该控制端 API 仅允许本机访问",
-        ))
-    }
-}
-
-fn load_control_settings(
-    paths: &cocos_build_lan_core::ToolPaths,
-    tool_id: uuid::Uuid,
-    control_port: u16,
-) -> Result<ToolSettings, std::io::Error> {
-    let path = paths.config_file();
-    let mut settings = if path.exists() {
-        serde_json::from_slice(&fs::read(&path)?).map_err(std::io::Error::other)?
-    } else {
-        ToolSettings::default()
-    };
-    if settings.network.lan_port == 0 {
-        settings.network.lan_port = first_available_business_port(tool_id, control_port)
-            .ok_or_else(|| std::io::Error::other("局域网业务端口候选均被占用"))?;
-        write_control_settings(&path, &settings)?;
-    }
-    Ok(settings)
-}
-
-fn resolve_control_port(tool_id: uuid::Uuid) -> Result<u16, std::io::Error> {
-    if let Ok(value) = std::env::var("COCOS_BUILD_LAN_CONTROL_PORT") {
-        let port = value
-            .parse::<u16>()
-            .map_err(|_| std::io::Error::other("控制端口环境变量无效"))?;
-        if control_port_candidates(tool_id).contains(&port) {
-            return Ok(port);
-        }
-        return Err(std::io::Error::other("控制端口不属于当前工具的候选范围"));
-    }
-    control_port_candidates(tool_id)
-        .into_iter()
-        .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
-        .ok_or_else(|| std::io::Error::other("本机控制端口候选均被占用"))
-}
-
-fn validate_lan_port(
-    control: &ControlState,
-    settings: &ToolSettings,
-) -> Result<(), crate::error::AppError> {
-    validate_lan_port_value(
-        control.control_port,
-        control.lan_port,
-        settings.network.lan_port,
-    )
-}
-
-fn validate_lan_port_value(
-    control_port: u16,
-    current_lan_port: u16,
-    port: u16,
-) -> Result<(), crate::error::AppError> {
-    if port == 0 {
-        return Err(crate::error::AppError::validation(
-            "局域网业务端口必须在 1 到 65535 之间",
-        ));
-    }
-    if port == control_port {
-        return Err(crate::error::AppError::validation(
-            "局域网业务端口不能使用当前工具的本机控制端口",
-        ));
-    }
-    if port != current_lan_port && std::net::TcpListener::bind(("0.0.0.0", port)).is_err() {
-        return Err(crate::error::AppError::conflict(format!(
-            "局域网业务端口 {port} 已被占用"
-        )));
-    }
-    Ok(())
-}
-
-fn write_control_settings(
-    path: &std::path::Path,
-    settings: &ToolSettings,
-) -> Result<(), std::io::Error> {
-    let temporary = path.with_extension("tmp");
-    fs::write(
-        &temporary,
-        serde_json::to_vec_pretty(settings).expect("settings 可序列化"),
-    )?;
-    fs::rename(temporary, path)
+async fn operation_request(
+    State(app): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, error::AppError> {
+    let _operation = app.operation().await?;
+    Ok(next.run(request).await)
 }
 
 fn resolve_web_root() -> PathBuf {
@@ -389,30 +373,56 @@ fn content_type(path: &std::path::Path) -> &'static str {
     }
 }
 
-fn init_tracing() {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_timer(ChronoLocal::new("%Y-%m-%d %H:%M:%S".to_owned()))
-        .compact()
-        .init();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
-
-    #[test]
-    fn lan_port_validation_rejects_zero_control_and_occupied_ports() {
-        assert!(validate_lan_port_value(41_001, 43_001, 0).is_err());
-        assert!(validate_lan_port_value(41_001, 43_001, 41_001).is_err());
-
-        let occupied = std::net::TcpListener::bind("0.0.0.0:0").expect("occupied port");
-        let port = occupied.local_addr().unwrap().port();
-        assert!(validate_lan_port_value(41_001, 43_001, port).is_err());
-        assert!(validate_lan_port_value(41_001, port, port).is_ok());
+    #[tokio::test]
+    async fn schemes_work_through_operation_middleware_but_reject_a_busy_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::load(dir.path().to_path_buf()).await;
+        state
+            .save_settings(models::AppSettings {
+                task_groups: vec![models::TaskGroup {
+                    id: "g".into(),
+                    name: "G".into(),
+                    branch: "main".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let scheme_id = state.find_task_group("g").await.unwrap().schemes.unwrap()[0]
+            .id
+            .clone();
+        let app = public_router(state.clone());
+        let uri = format!("/api/task-groups/g/schemes/{scheme_id}/apply");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        state.try_start_build().await.unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
