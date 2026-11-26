@@ -1,6 +1,6 @@
 {
   "name": "@tsixi/cocos-build-lan",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "内网 Cocos 构建工具：TUI、Web 设置与构建服务",
   "license": "MIT OR Apache-2.0",
   "type": "module",
