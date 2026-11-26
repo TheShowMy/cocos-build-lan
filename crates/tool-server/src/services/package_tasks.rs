@@ -148,7 +148,7 @@ pub async fn start_task_obfuscation(state: AppState, task_id: String) -> Result<
         state.set_active_task(Some(task_id.clone())).await;
         if let Err(error) = super::build::cancel_on_request(
             &state,
-            run_task_obfuscation_job(state.clone(), &task_id),
+            state.with_task_repos(&task_id, run_task_obfuscation_job(state.clone(), &task_id)),
         )
         .await
         {

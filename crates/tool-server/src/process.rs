@@ -13,6 +13,57 @@ use std::{
 static JOBS: OnceLock<Mutex<Vec<Weak<Job>>>> = OnceLock::new();
 static STOPPING: AtomicBool = AtomicBool::new(false);
 
+#[cfg(windows)]
+tokio::task_local! { static PRIVATE_REPOS: Job; }
+
+/// A named job survives the last handle until its last process exits. A new
+/// operation therefore cannot take over a canceled operation's private repos.
+pub async fn with_private_repos<T>(
+    dir: &std::path::Path,
+    work: impl Future<Output = Result<T, crate::error::AppError>>,
+) -> Result<T, crate::error::AppError> {
+    std::fs::create_dir_all(dir)?;
+    let busy = || {
+        crate::error::AppError::conflict(format!(
+            "任务私有仓库正被占用：{}；请结束占用后重新启动此任务",
+            dir.display()
+        ))
+    };
+    #[cfg(windows)]
+    {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut key = DefaultHasher::new();
+        dir.canonicalize()?
+            .to_string_lossy()
+            .to_lowercase()
+            .hash(&mut key);
+        let name: Vec<u16> = format!("Global\\cocos-build-lan-repos-{:016x}\0", key.finish())
+            .encode_utf16()
+            .collect();
+        for attempt in 0..=5 {
+            match Job::create(name.as_ptr()) {
+                Ok(job) => return PRIVATE_REPOS.scope(job, work).await,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempt < 5 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(busy()),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        unreachable!()
+    }
+    #[cfg(not(windows))]
+    {
+        let lease = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(".private-repos.lock"))?;
+        fs2::FileExt::try_lock_exclusive(&lease).map_err(|_| busy())?;
+        work.await
+    }
+}
+
 pub fn stop_all() {
     STOPPING.store(true, Ordering::SeqCst);
     if let Some(jobs) = JOBS.get() {
@@ -116,35 +167,57 @@ unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 #[cfg(windows)]
 impl Job {
-    fn attach(child: &tokio::process::Child) -> io::Result<Self> {
-        use windows_sys::Win32::{Foundation::CloseHandle, System::JobObjects::*};
-        #[link(name = "ntdll")]
-        unsafe extern "system" {
-            fn NtResumeProcess(process: windows_sys::Win32::Foundation::HANDLE) -> i32;
-        }
+    fn create(name: *const u16) -> io::Result<Self> {
+        use windows_sys::Win32::{
+            Foundation::{ERROR_ALREADY_EXISTS, GetLastError},
+            System::JobObjects::*,
+        };
         unsafe {
-            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            let handle = CreateJobObjectW(std::ptr::null(), name);
             if handle.is_null() {
                 return Err(io::Error::last_os_error());
             }
+            let exists = !name.is_null() && GetLastError() == ERROR_ALREADY_EXISTS;
+            let job = Self(handle);
+            if exists {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let process = child
-                .raw_handle()
-                .ok_or_else(|| io::Error::other("子进程句柄不可用"))?;
             if SetInformationJobObject(
                 handle,
                 JobObjectExtendedLimitInformation,
                 (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
                 std::mem::size_of_val(&info) as u32,
             ) == 0
-                || AssignProcessToJobObject(handle, process) == 0
             {
-                let error = io::Error::last_os_error();
-                CloseHandle(handle);
-                return Err(error);
+                return Err(io::Error::last_os_error());
             }
-            let job = Self(handle);
+            Ok(job)
+        }
+    }
+    fn attach(child: &tokio::process::Child) -> io::Result<Self> {
+        use windows_sys::Win32::{
+            Foundation::HANDLE, System::JobObjects::AssignProcessToJobObject,
+        };
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtResumeProcess(process: HANDLE) -> i32;
+        }
+        let process = child
+            .raw_handle()
+            .ok_or_else(|| io::Error::other("子进程句柄不可用"))?;
+        let job = Self::create(std::ptr::null())?;
+        unsafe {
+            if let Ok(result) =
+                PRIVATE_REPOS.try_with(|outer| AssignProcessToJobObject(outer.0, process))
+                && result == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if AssignProcessToJobObject(job.0, process) == 0 {
+                return Err(io::Error::last_os_error());
+            }
             if NtResumeProcess(process) < 0 {
                 return Err(io::Error::other("无法恢复受控子进程"));
             }

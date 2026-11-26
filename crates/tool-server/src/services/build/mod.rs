@@ -1,6 +1,7 @@
 pub(crate) mod cocos;
 mod logging;
 mod prep_executor;
+mod private_repo;
 mod queue;
 mod task;
 

@@ -136,8 +136,14 @@ async fn run_build_queue(state: AppState, task_ids: Vec<String>) -> Result<(), A
             break;
         }
         state.set_active_task(Some(task_id.clone())).await;
-        match super::cancel_on_request(&state, run_single_task(&state, task_id, &start_notify_logs))
-            .await
+        match super::cancel_on_request(
+            &state,
+            state.with_task_repos(
+                task_id,
+                run_single_task(&state, task_id, &start_notify_logs),
+            ),
+        )
+        .await
         {
             Ok(()) => {
                 if let Some(task) = task_snapshots.iter().find(|task| task.task_id == *task_id) {

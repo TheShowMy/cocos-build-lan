@@ -267,7 +267,12 @@ async fn cleanup_private_repos(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Result<axum::Json<crate::models::TaskPrivateReposCleanupResponse>, AppError> {
-    let result = services::package_tasks::cleanup_task_private_repos(&state, &task_id).await?;
+    let result = state
+        .with_task_repos(
+            &task_id,
+            services::package_tasks::cleanup_task_private_repos(&state, &task_id),
+        )
+        .await?;
     Ok(axum::Json(result))
 }
 

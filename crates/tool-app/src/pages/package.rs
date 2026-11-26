@@ -249,20 +249,22 @@ pub fn Package() -> Element {
                 }
                 section { class: "global-queue",
                     strong { "全局构建队列" }
+                    span { "全局已勾选 {all_ids().len()} 项" }
                     div { class: "global-queue__details", role: "region", "aria-label": "全局队列详情", tabindex: "0",
                         for group in settings().task_groups {
                             { let count = selected_in_group(&settings(), &selected_tasks(), &group.id).len(); rsx! { if count > 0 { span { "{group.name}：已选 {count} 项" } } } }
                         }
                         if global_dirty { p { class: "field-error", "所选任务组有未保存参数" } }
                         if !status_known() { p { class: "hint", "队列状态尚未确认，暂不能启动" } }
-                        if build_status().build_in_progress {
-                            span { if build_status().cancel_requested { "正在停止整个队列…" } else { "全局队列占用" } }
-                            if let Some(task) = &active_task { span { "{task.name} · {task.group}" } }
-                            span { "等待 {build_status().queued_task_ids.len()} 项" }
+                        if status_known() && build_status().build_in_progress {
+                            if build_status().cancel_requested { span { "正在停止整个队列…" } }
+                            if let Some(task) = &active_task { span { "本轮正在执行：{task.name} · {task.group}" } }
+                            span { "本轮等待 {build_status().queued_task_ids.len()} 项" }
+                        } else if status_known() {
+                            span { "当前无构建队列" }
                         }
                     }
-                    span { "合计 {all_ids().len()} 项 · 串行执行" }
-                    button { class: "btn btn--primary", disabled: global_disabled, onclick: move |_| start_tasks(all_ids(), context, build_status, action_busy), if !action_busy().is_empty() { "提交中…" } else { "启动全部已选任务" } }
+                    button { class: "btn btn--primary", disabled: global_disabled, onclick: move |_| { let ids = all_ids(); let message = format!("已提交全局勾选的 {} 项任务", ids.len()); start_tasks(ids, "global".into(), message, context, build_status, action_busy); }, if action_busy() == "global" { "提交中…" } else { "启动全部已选任务" } }
                     button { class: "btn btn--sm", disabled: (ui.managing)() || (ui.saving)() || selected_tasks().is_empty(), onclick: move |_| selected_tasks.set(Vec::new()), "清空全部勾选" }
                     if build_status().build_in_progress {
                         if let Some(task) = active_task {
@@ -279,7 +281,7 @@ pub fn Package() -> Element {
                     GroupDetail { task_ids: current_tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>(), queue_busy: !status_known() || build_status().build_in_progress, key: "{group.id}", group: group.clone(), project: settings().projects.into_iter().find(|project| project.id == group.project_id), definitions: settings().param_definitions, on_edit: move |group| group_editor.set(Some((false, group))), on_delete: move |group| delete_group.set(Some(group)), on_saved: move |_| refresh += 1 }
                     div { class: if selected_count == 0 { "batch-bar is-empty" } else { "batch-bar" },
                             strong { "本组已选 {selected_count} 项" }
-                            button { class: "btn btn--sm btn--primary", disabled: selected_count == 0 || !blocked.is_empty(), title: blocked, onclick: move |_| start_tasks(current_ids(), context, build_status, action_busy), Icon { width: 14, height: 14, icon: LdPlay } "启动本组已选" }
+                            button { class: "btn btn--sm btn--primary", disabled: selected_count == 0 || !blocked.is_empty(), title: blocked, onclick: move |_| { let ids = current_ids(); let message = format!("已提交本组勾选的 {} 项任务", ids.len()); start_tasks(ids, format!("group:{}", selected_group()), message, context, build_status, action_busy); }, Icon { width: 14, height: 14, icon: LdPlay } if action_busy() == format!("group:{}", group.id) { "提交中…" } else { "启动本组已选" } }
                             button { class: "btn btn--sm", disabled: selected_count == 0 || preps().is_empty() || !blocked.is_empty(), onclick: move |_| { batch_prep_result.set(None); if let Some(prep) = preps().first() { batch_prep_id.set(prep.id.clone()); batch_prep_values.set(default_prep_values(prep)); } batch_prep_open.set(true); }, Icon { width: 14, height: 14, icon: LdHammer } "执行准备项目" }
                             button { class: "btn btn--sm btn--danger", disabled: selected_count == 0 || build_status().build_in_progress, onclick: move |_| confirm_batch_delete.set(true), Icon { width: 14, height: 14, icon: LdTrash2 } "删除" }
                             if !poll_error().is_empty() { span { class: "tag tag--err", title: "{poll_error}", "状态连接中断" } }
@@ -621,7 +623,7 @@ fn TaskRow(
         td { div { class: "table__actions",
             if task.enable_obfuscation { button { class: "btn btn--sm btn--icon", title: "单独执行混淆", disabled: running || !busy.is_empty(), onclick: { let id = task.id.clone(); move |_| run_obfuscation(id.clone(), context, statuses, submitting) }, Icon { width: 14, height: 14, icon: LdSparkles } } }
             if running { button { class: "btn btn--sm", disabled: status == TaskStatus::Canceling || !submitting().is_empty(), onclick: { let id = task.id.clone(); move |_| on_stop.call(id.clone()) }, Icon { width: 14, height: 14, icon: LdCircleStop } "停止整个队列" } }
-            else { button { class: "btn btn--sm btn--primary", disabled: !busy.is_empty(), title: "{busy}", onclick: { let id = task.id.clone(); move |_| start_tasks(vec![id.clone()], context, statuses, submitting) }, Icon { width: 14, height: 14, icon: LdPlay } "启动" } }
+            else { button { class: "btn btn--sm btn--primary", disabled: !busy.is_empty(), title: "{busy}", onclick: { let id = task.id.clone(); let name = task.name.clone(); move |_| start_tasks(vec![id.clone()], format!("task:{id}"), format!("已提交任务「{name}」"), context, statuses, submitting) }, Icon { width: 14, height: 14, icon: LdPlay } if submitting() == format!("task:{}", task.id) { "提交中…" } else { "启动" } } }
             button { class: "btn btn--sm btn--icon", title: "上移", disabled: index == 0 || running || queued, onclick: { let task_id = task.id.clone(); let tasks = all_tasks.clone(); let group_id = group_id.clone(); move |event| reorder_task(tasks.clone(), &task_id, -1, group_id.clone(), on_refresh, event, context) }, Icon { width: 14, height: 14, icon: LdChevronUp } }
             button { class: "btn btn--sm btn--icon", title: "下移", disabled: index + 1 == total || running || queued, onclick: { let task_id = task.id.clone(); let tasks = all_tasks.clone(); let group_id = group_id.clone(); move |event| reorder_task(tasks.clone(), &task_id, 1, group_id.clone(), on_refresh, event, context) }, Icon { width: 14, height: 14, icon: LdChevronDown } }
             button { class: "btn btn--sm btn--icon", title: "复制", disabled: running || queued, onclick: { let id = task.id.clone(); move |event| duplicate_task(id.clone(), on_refresh, event, context) }, Icon { width: 14, height: 14, icon: LdCopy } }
@@ -939,6 +941,8 @@ fn task_runtime(
 
 fn start_tasks(
     ids: Vec<String>,
+    source: String,
+    message: String,
     context: AppContext,
     mut status: Signal<BuildStatusResponse>,
     mut busy: Signal<String>,
@@ -950,12 +954,11 @@ fn start_tasks(
         context.error("请先选择任务");
         return;
     }
-    busy.set("start".into());
+    busy.set(source);
     spawn(async move {
         match api::post::<Value, _>("/api/build/start", &json!({"taskIds": ids})).await {
             Ok(_) => {
-                status.write().build_in_progress = true;
-                context.success("构建任务已启动");
+                context.success(message);
                 if let Ok(value) = api::get("/api/build/status").await {
                     status.set(value);
                 }

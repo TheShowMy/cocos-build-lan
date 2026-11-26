@@ -180,6 +180,7 @@ pub async fn run_single_task(
         None
     } else {
         sync_optional_repo(
+            &state.workspaces_dir(),
             &task.code_repo_url,
             &code_repo_dir,
             &settings.git_config,
@@ -201,6 +202,7 @@ pub async fn run_single_task(
     }
 
     let asset_repo = sync_optional_repo(
+        &state.workspaces_dir(),
         &task.asset_repo_url,
         &asset_repo_dir,
         &settings.git_config,
@@ -544,6 +546,7 @@ pub(crate) async fn run_task_obfuscation(
 }
 
 async fn sync_optional_repo(
+    workspace: &Path,
     git_url: &str,
     repo_dir: &std::path::Path,
     git_config: &crate::models::GitConfig,
@@ -555,6 +558,16 @@ async fn sync_optional_repo(
         return Ok(None);
     }
 
+    if super::private_repo::recover_index_lock(workspace, repo_dir).await? {
+        write_log_line(
+            log_file,
+            &format!(
+                "{label}已移除残留的 .git/index.lock：{}",
+                repo_dir.display()
+            ),
+        )
+        .await?;
+    }
     let result = git::ensure_repo_synced(repo_dir, git_url, git_config, None)
         .await
         .map_err(AppError::internal)?;

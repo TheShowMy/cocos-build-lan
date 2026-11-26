@@ -277,16 +277,16 @@ pub async fn run_prep_project_for_tasks(
     let mut results = Vec::with_capacity(request.task_ids.len());
 
     for task_id in request.task_ids {
-        let execution_context = build_task_prep_execution_context(state, &task_id).await;
-        let item = match execution_context {
-            Ok(context) => {
-                match run_prep_project(
+        let execution = state
+            .with_task_repos(&task_id, async {
+                let context = build_task_prep_execution_context(state, &task_id).await?;
+                let result = run_prep_project(
                     &prep_project,
                     request.params.clone(),
                     &context.placeholder_context,
                 )
-                .await
-                {
+                .await;
+                Ok(match result {
                     Ok(result) => PrepProjectTaskRunItem {
                         task_id: context.task.id,
                         task_name: context.task.name,
@@ -310,8 +310,11 @@ pub async fn run_prep_project_for_tasks(
                         context.placeholder_context.project_path.as_str(),
                         error.message(),
                     ),
-                }
-            }
+                })
+            })
+            .await;
+        let item = match execution {
+            Ok(item) => item,
             Err(error) => match state.find_task(&task_id).await {
                 Ok(task) => failed_task_run_item(
                     &task.id,

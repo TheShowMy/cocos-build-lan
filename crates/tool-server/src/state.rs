@@ -585,6 +585,17 @@ impl AppState {
         self.workspaces_dir().join(&project.workspace_dir_key)
     }
 
+    pub async fn with_task_repos<T>(
+        &self,
+        id: &str,
+        work: impl Future<Output = Result<T, AppError>>,
+    ) -> Result<T, AppError> {
+        let task = self.find_task(id).await?;
+        let (project, _) = self.resolve_task_context(&task).await?;
+        let dir = self.workspace_project_dir(&project).join("tasks").join(id);
+        crate::process::with_private_repos(&dir, work).await
+    }
+
     fn spawn_runtime_flush_task(&self) {
         let state = self.clone();
         tokio::spawn(async move {
